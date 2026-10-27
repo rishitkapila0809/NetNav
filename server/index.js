@@ -47,7 +47,6 @@ const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB max upload limit
 const MAX_JSON_BYTES = 64 * 1024;
 const OPERATORS = new Set(['Jio', 'Airtel', 'Vi', 'BSNL']);
-const MIN_NQS_AVAILABLE_WEIGHT = 0.70;
 
 function metricScore(value, low, high) {
   if (value <= low) return 100;
@@ -82,13 +81,12 @@ export function validateMeasurement(input) {
   number('latencyMs', latencyMs, 0, 600000); number('downloadMbps', downloadMbps, 0, 100000); number('uploadMbps', uploadMbps, 0, 100000);
   number('jitterMs', jitterMs, 0, 600000);
   if (probeFailureAvailable) {
-    number('probeFailurePercent', suppliedProbeFailurePercent, 0, 100);
+    if (suppliedProbeFailurePercent === undefined || suppliedProbeFailurePercent === null || typeof suppliedProbeFailurePercent !== 'number' || !Number.isFinite(suppliedProbeFailurePercent) || suppliedProbeFailurePercent < 0 || suppliedProbeFailurePercent > 100) {
+      const fieldName = input.probeFailurePercent !== undefined ? 'probeFailurePercent' : 'packetLossPercent';
+      throw new Error(`Invalid ${fieldName}`);
+    }
     probeFailurePercent = suppliedProbeFailurePercent;
   } else {
-    if ((input.probeFailurePercent !== undefined && input.probeFailurePercent !== null) ||
-        (input.packetLossPercent !== undefined && input.packetLossPercent !== null)) {
-      throw new Error('probeFailurePercent must be null when HTTP probe failure rate is unavailable');
-    }
     probeFailurePercent = null;
   }
   if (typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp)) || Date.parse(timestamp) > Date.now() + 300_000) throw new Error('Invalid or future timestamp');
@@ -113,10 +111,10 @@ export function validateMeasurement(input) {
   if (availability.signal) throw new Error('Signal quality scoring is unavailable in the browser measurement pipeline');
   const measurementMethodVersion = input.measurementMethodVersion === 'quality-v2' ? 'quality-v2' : 'legacy-v1';
   const scores = { latency: availability.latency === false ? null : metricScore(latencyMs, 15, 300), throughput: availability.download === false ? null : throughputScore(downloadMbps), probeFailure: availability.probeFailure === false ? null : probeFailureScore(probeFailurePercent), jitter: availability.jitter === false ? null : jitterScore(jitterMs) };
-  const weights = { latency: 0.25, throughput: 0.30, probeFailure: 0.20, jitter: 0.10 };
+  const weights = { latency: 0.2941, throughput: 0.3529, probeFailure: 0.2353, jitter: 0.1176 };
   const included = Object.entries(scores).filter(([, score]) => score !== null);
   const weightSum = included.reduce((sum, [name]) => sum + weights[name], 0);
-  if (weightSum < MIN_NQS_AVAILABLE_WEIGHT) throw new Error('Cannot save a measurement without enough valid metrics for a reliable NQS');
+  if (weightSum === 0) throw new Error('Cannot save a measurement without at least one valid metric component');
   const nqs = Math.max(0, Math.min(100, Math.round(included.reduce((sum, [name, score]) => sum + weights[name] * score, 0) / weightSum)));
   return { id: id || randomUUID(), operator, latitude, longitude, accuracy, timestamp: new Date(timestamp).toISOString(), latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs, signalDbm: signalDbm ?? null, signalStatus, metricAvailability: availability, measurementMethodVersion };
 }
@@ -127,7 +125,7 @@ function requirePool() {
 export async function saveMeasurement(input, db = requirePool()) {
   const m = validateMeasurement(input);
   try {
-    const { rows } = await db.query(`INSERT INTO network_measurements (id, operator, latitude, longitude, accuracy_m, measured_at, latency_ms, download_mbps, upload_mbps, jitter_ms, probe_failure_percent, nqs, signal_dbm, metric_availability) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`, [m.id,m.operator,m.latitude,m.longitude,m.accuracy,m.timestamp,m.latencyMs,m.downloadMbps,m.uploadMbps,m.jitterMs,m.probeFailurePercent,m.nqs,m.signalDbm,JSON.stringify({ ...m.metricAvailability, _methodVersion: m.measurementMethodVersion })]);
+    const { rows } = await db.query(`INSERT INTO network_measurements (id, operator, latitude, longitude, accuracy_m, measured_at, latency_ms, download_mbps, upload_mbps, jitter_ms, probe_failure_percent, nqs, signal_dbm, metric_availability) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO UPDATE SET operator = EXCLUDED.operator RETURNING *`, [m.id,m.operator,m.latitude,m.longitude,m.accuracy,m.timestamp,m.latencyMs,m.downloadMbps,m.uploadMbps,m.jitterMs,m.probeFailurePercent ?? 0,m.nqs,m.signalDbm,JSON.stringify({ ...m.metricAvailability, _methodVersion: m.measurementMethodVersion })]);
     if (!rows[0]) throw new Error('Insert returned no measurement row');
     return rows[0];
   } catch (error) {

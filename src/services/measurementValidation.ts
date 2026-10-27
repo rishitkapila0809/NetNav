@@ -58,7 +58,6 @@ import type { LiveMeasurement } from '../types';
 export function shouldPersistMeasurement(sample: LiveMeasurement): boolean {
   return sample.measurementMethodVersion === 'quality-v2' && sample.throughputTestPerformed === true &&
     !sample.isOffline && sample.status !== 'NO_CONNECTIVITY' && sample.status !== 'UNAVAILABLE' &&
-    sample.metricAvailability?.probeFailure === true &&
     Number.isFinite(sample.nqs) && sample.nqs >= 0 && sample.nqs <= 100 &&
     Number.isFinite(Date.parse(sample.timestamp)) &&
     Number.isFinite(sample.latitude) && sample.latitude >= -90 && sample.latitude <= 90 &&

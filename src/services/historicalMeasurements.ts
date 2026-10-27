@@ -21,9 +21,12 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
   const accuracy = numeric(row.accuracy, 0, 10000);
   // The Express history API aliases the database SMALLINT to `nqs`; accept `NQS`
   // as a compatibility spelling for older exports without deriving a score.
-  const nqs = numeric(row.nqs ?? row.NQS, 0, 100);
+  const rawNqs = numeric(row.nqs ?? row.NQS, 0, 100);
+  const hasStoredNqs = rawNqs !== undefined;
+  const nqs = rawNqs ?? 0;
+  if (rawNqs === undefined && (row.nqs !== undefined || row.NQS !== undefined)) return null;
   const timestamp = new Date(String(row.timestamp));
-  if (latitude === undefined || longitude === undefined || accuracy === undefined || nqs === undefined || !Number.isFinite(timestamp.getTime()) || timestamp.getTime() > Date.now() + 300_000) return null;
+  if (latitude === undefined || longitude === undefined || accuracy === undefined || !Number.isFinite(timestamp.getTime()) || timestamp.getTime() > Date.now() + 300_000) return null;
 
   const rawAvailability = row.metricAvailability && typeof row.metricAvailability === 'object' && !Array.isArray(row.metricAvailability)
     ? row.metricAvailability as Record<string, unknown> : {};
@@ -59,7 +62,7 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
     latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs,
     downloadMeasuredAt: storedDownloadAt ?? (measurementMethodVersion === 'quality-v2' ? timestamp.toISOString() : undefined),
     uploadMeasuredAt: storedUploadAt ?? (measurementMethodVersion === 'quality-v2' ? timestamp.toISOString() : undefined),
-    status: row.status === 'NO_CONNECTIVITY' ? 'NO_CONNECTIVITY' : !hasScorableMetric ? 'UNAVAILABLE' : nqs >= 80 ? 'EXCELLENT' : nqs >= 60 ? 'GOOD' : nqs >= 40 ? 'MODERATE' : 'POOR',
+    status: row.status === 'NO_CONNECTIVITY' ? 'NO_CONNECTIVITY' : (!hasStoredNqs || !hasScorableMetric) ? 'UNAVAILABLE' : nqs >= 80 ? 'EXCELLENT' : nqs >= 60 ? 'GOOD' : nqs >= 40 ? 'MODERATE' : 'POOR',
     measurementMethodVersion,
     signalDbm: metricAvailability.signal ? signalDbm : undefined,
     signalStatus: metricAvailability.signal && signalDbm !== undefined ? 'AVAILABLE' : 'UNAVAILABLE',
@@ -109,16 +112,57 @@ export function recencyWeightedGroupNqs(group: LiveMeasurement[], now = Date.now
   return weightSum ? Math.round(scored.reduce((sum, row, index) => sum + row.nqs * weights[index], 0) / weightSum) : null;
 }
 
-export function historicalMarkerSpec(group: LiveMeasurement[], now = Date.now()): { position: { lat: number; lng: number }; color: string; count: number; scoredCount: number; scoreField: 'nqs'; label: string; unavailableReason: string | null; nqs: number | null } {
+export function historicalMarkerSpec(group: LiveMeasurement[], now = Date.now()): { position: { lat: number; lng: number }; color: string; count: number; scoredCount: number; scoreField: 'nqs'; label: string; isLegacy: boolean; unavailableReason: string | null; nqs: number | null } {
   const row = group[0];
-  const scoredCount = trustedScoredRows(group).length;
-  const nqs = recencyWeightedGroupNqs(group, now);
-  const allLegacy = group.length > 0 && group.every((item) => item.measurementMethodVersion === 'legacy-v1');
-  const unavailableReason = nqs !== null ? null : allLegacy
-    ? 'No trusted NQS: this group contains only legacy/unverified measurements.'
-    : 'No trusted NQS: no eligible quality-v2 record has a valid available score.';
-  return { position: { lat: row.latitude, lng: row.longitude }, color: nqs === null ? '#60788C' : getNqsMarkerColor(nqs), count: group.length,
-    scoredCount, scoreField: 'nqs', label: nqs === null ? 'N/A' : String(nqs), unavailableReason, nqs };
+  const trusted = trustedScoredRows(group);
+  const scoredCount = trusted.length;
+  if (scoredCount > 0) {
+    const nqs = recencyWeightedGroupNqs(group, now);
+    return {
+      position: { lat: row.latitude, lng: row.longitude },
+      color: nqs === null ? '#60788C' : getNqsMarkerColor(nqs),
+      count: group.length,
+      scoredCount,
+      scoreField: 'nqs',
+      label: nqs === null ? 'N/A' : String(nqs),
+      isLegacy: false,
+      unavailableReason: null,
+      nqs
+    };
+  }
+
+  // No trusted quality-v2 rows. Check for stored numeric NQS in legacy/unverified rows.
+  const legacyScored = group.filter((item) => item.status !== 'UNAVAILABLE' && item.status !== 'NO_CONNECTIVITY' && Number.isFinite(item.nqs) && item.nqs >= 0 && item.nqs <= 100);
+  if (legacyScored.length > 0) {
+    const weights = legacyScored.map((item) => Math.pow(0.5, Math.max(0, now - Date.parse(item.timestamp)) / NQS_RECENCY_HALF_LIFE_MS));
+    const weightSum = weights.reduce((sum, w) => sum + w, 0);
+    const legacyNqs = weightSum ? Math.round(legacyScored.reduce((sum, item, idx) => sum + item.nqs * weights[idx], 0) / weightSum) : legacyScored[0].nqs;
+    return {
+      position: { lat: row.latitude, lng: row.longitude },
+      color: getNqsMarkerColor(legacyNqs),
+      count: group.length,
+      scoredCount: 0,
+      scoreField: 'nqs',
+      label: String(legacyNqs),
+      isLegacy: true,
+      unavailableReason: 'Unverified legacy score: stored under earlier measurement method.',
+      nqs: legacyNqs
+    };
+  }
+
+  return {
+    position: { lat: row.latitude, lng: row.longitude },
+    color: '#60788C',
+    count: group.length,
+    scoredCount: 0,
+    scoreField: 'nqs',
+    label: 'N/A',
+    isLegacy: false,
+    unavailableReason: group.length > 0 && group.every((item) => item.measurementMethodVersion === 'legacy-v1')
+      ? 'No trusted NQS: this group contains only legacy/unverified measurements.'
+      : 'No trusted NQS: no eligible quality-v2 record has a valid available score.',
+    nqs: null
+  };
 }
 
 export interface HistoricalScoreDiagnostics { loaded: number; validNqs: number; trustedNqs: number; legacyOrUnverified: number; ineligible: number }
@@ -144,15 +188,19 @@ export function historicalDetailHtml(rows: LiveMeasurement[]): string {
   const esc = (value: string) => value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
   const aggregate = recencyWeightedGroupNqs(rows);
   const spec = historicalMarkerSpec(rows);
-  const scoreNote = `<div>Marker score uses stored ${spec.scoreField} from ${spec.scoredCount} eligible sample(s).${spec.unavailableReason ? ` ${esc(spec.unavailableReason)}` : ''}</div>`;
-  const summary = `<strong>${rows.length} saved sample${rows.length === 1 ? '' : 's'} Â· Recency-weighted NQS: ${aggregate === null ? 'N/A' : `${aggregate}/100`}</strong>`;
+  const scoreNote = spec.isLegacy
+    ? `<div>Marker displays stored legacy score (${spec.label}) with an unverified legacy indicator. Excluded from Find Best Spot and route rankings.</div>`
+    : `<div>Marker score uses stored ${spec.scoreField} from ${spec.scoredCount} eligible sample(s).${spec.unavailableReason ? ` ${esc(spec.unavailableReason)}` : ''}</div>`;
+  const summary = spec.isLegacy
+    ? `<strong>${rows.length} saved sample${rows.length === 1 ? '' : 's'} · Stored legacy NQS: ${spec.label}/100 (Unverified legacy score)</strong>`
+    : `<strong>${rows.length} saved sample${rows.length === 1 ? '' : 's'} · Recency-weighted NQS: ${aggregate === null ? 'N/A' : `${aggregate}/100`}</strong>`;
   return `<div style="font:12px system-ui,sans-serif;color:#101820;max-width:300px;max-height:320px;overflow:auto">${summary}${scoreNote}${rows.map((row) => {
     const available = row.metricAvailability ?? {};
     const metric = (key: string, value: number | undefined, suffix: string) => formatHistoricalMetric(value, available[key] === true, suffix);
     return `<section style="padding:6px 0;border-bottom:1px solid #ccd">` +
-      `${row.measurementMethodVersion === 'legacy-v1' ? '<div><strong>Legacy measurement method:</strong> this score and sample cadence are not comparable with corrected readings.</div>' : ''}` +
+      `${row.measurementMethodVersion === 'legacy-v1' ? '<div><strong>Legacy measurement method (Unverified legacy score):</strong> this score and sample cadence are not comparable with corrected readings.</div>' : ''}` +
       `<strong>${esc(row.operator)} · ${esc(new Date(row.timestamp).toLocaleString())}</strong>` +
-      `<div>NQS: ${row.nqs}/100</div><div>Latency: ${metric('latency', row.latencyMs, 'ms')}</div>` +
+      `<div>NQS: ${row.status === 'UNAVAILABLE' ? 'N/A' : `${row.nqs}/100`}</div><div>Latency: ${metric('latency', row.latencyMs, 'ms')}</div>` +
       `<div>Download: ${metric('download', row.downloadMbps, 'Mbps')}</div><div>Upload: ${metric('upload', row.uploadMbps, 'Mbps')}</div>` +
       `<div>Jitter: ${metric('jitter', row.jitterMs, 'ms')}</div><div>Probe failure: ${metric('probeFailure', row.probeFailurePercent, '%')}</div>` +
       `<div>GPS accuracy: ${esc(String(row.accuracy))} m</div><div>Signal: ${available.signal === true && row.signalDbm !== undefined ? `${row.signalDbm} dBm (available)` : 'N/A (unavailable)'}</div>` +

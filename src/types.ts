@@ -77,6 +77,7 @@ export interface LiveMeasurement {
   uploadMeasuredAt?: string;
   isOffline?: boolean;
   metricAvailability?: Record<string, boolean>;
+  isProvisional?: boolean;
   offlineReason?: 'MEASUREMENT_SERVER_UNREACHABLE';
   nqsComponents?: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null; raw: number | null };
 }

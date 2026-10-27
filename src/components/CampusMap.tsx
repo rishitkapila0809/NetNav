@@ -195,6 +195,7 @@ export const CampusMap: React.FC<CampusMapProps> = ({
 
   // Route & Segment Polylines Refs
   const polylineSegmentsRef = useRef<google.maps.Polyline[]>([]);
+  const livePointMarkersRef = useRef<google.maps.Marker[]>([]);
   const historicalMarkersRef = useRef<google.maps.Marker[]>([]);
   const findBestMarkerRef = useRef<google.maps.Marker | null>(null);
   const walkingRouteLinesRef = useRef<google.maps.Polyline[]>([]);
@@ -516,8 +517,17 @@ export const CampusMap: React.FC<CampusMapProps> = ({
       const marker = new google.maps.Marker({
         map,
         position: spec.position,
-        title: `${row.operator} · stored NQS ${spec.label} · ${spec.scoredCount}/${group.length} eligible saved sample(s) · source field: ${spec.scoreField}`,
-        icon: { path: google.maps.SymbolPath.CIRCLE, fillColor: spec.color, fillOpacity: 0.98, strokeColor: '#FFFFFF', strokeWeight: 1.5, scale: group.length > 1 ? 12 : 10 },
+        title: spec.isLegacy
+          ? `${row.operator} · Unverified legacy score: NQS ${spec.label} · ${group.length} saved sample(s)`
+          : `${row.operator} · stored NQS ${spec.label} · ${spec.scoredCount}/${group.length} eligible saved sample(s) · source field: ${spec.scoreField}`,
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          fillColor: spec.color,
+          fillOpacity: 0.98,
+          strokeColor: spec.isLegacy ? '#FFB800' : '#FFFFFF',
+          strokeWeight: spec.isLegacy ? 2.5 : 1.5,
+          scale: group.length > 1 ? 12 : 10
+        },
         label: { text: spec.label, color: spec.nqs === null || spec.nqs < 40 ? '#FFFFFF' : '#07111D', fontWeight: '800', fontSize: spec.label === 'N/A' ? '11px' : '12px' },
         zIndex: 500 + (spec.nqs ?? 0)
       });
@@ -564,12 +574,15 @@ export const CampusMap: React.FC<CampusMapProps> = ({
     }
   }, [bestSpotCandidate, loading]);
 
-  // Only draw ordered, geographically continuous current-session samples. History is never passed here.
+  // Draw ordered live path segments AND plot every coordinate-valid live measurement point immediately.
   useEffect(() => {
     const map = googleMapRef.current;
     if (!map || loading) return;
     polylineSegmentsRef.current.forEach((segment) => segment.setMap(null));
     polylineSegmentsRef.current = [];
+    livePointMarkersRef.current.forEach((marker) => marker.setMap(null));
+    livePointMarkersRef.current = [];
+
     for (const [previous, current] of getLivePathSegments(liveMeasurements)) {
       polylineSegmentsRef.current.push(new google.maps.Polyline({
         map,
@@ -579,6 +592,53 @@ export const CampusMap: React.FC<CampusMapProps> = ({
         strokeOpacity: 0.9,
         strokeWeight: 5
       }));
+    }
+
+    for (const sample of liveMeasurements) {
+      if (!Number.isFinite(sample.latitude) || sample.latitude < -90 || sample.latitude > 90 ||
+          !Number.isFinite(sample.longitude) || sample.longitude < -180 || sample.longitude > 180) continue;
+      const isUnavailable = sample.status === 'UNAVAILABLE' || sample.status === 'NO_CONNECTIVITY' || !Number.isFinite(sample.nqs);
+      const label = isUnavailable ? 'N/A' : String(sample.nqs);
+      const color = isUnavailable ? '#60788C' : networkMeasurer.getNqsColor(sample.nqs, sample.status);
+      const marker = new google.maps.Marker({
+        map,
+        position: { lat: sample.latitude, lng: sample.longitude },
+        title: `Live measurement (${sample.operator}) · NQS ${label} · ${sample.status}`,
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          fillColor: color,
+          fillOpacity: 0.95,
+          strokeColor: '#35F4FF',
+          strokeWeight: 2,
+          scale: 11
+        },
+        label: {
+          text: label,
+          color: label === 'N/A' || sample.nqs < 40 ? '#FFFFFF' : '#07111D',
+          fontWeight: '800',
+          fontSize: label === 'N/A' ? '10px' : '11px'
+        },
+        zIndex: 600 + (sample.nqs ?? 0)
+      });
+      const metrics = sample.metricAvailability ?? {};
+      const formatVal = (key: string, val: number | undefined, unit: string) => metrics[key] === true && val !== undefined && Number.isFinite(val) ? `${val} ${unit}` : 'N/A';
+      const infoContent = `<div style="font:12px system-ui,sans-serif;color:#101820;max-width:280px;padding:4px">` +
+        `<strong>LIVE MEASUREMENT · ${sample.operator}</strong>` +
+        `<div>NQS: <strong>${label}</strong> / 100 (${sample.status}${sample.isProvisional ? ' · Provisional' : ''})</div>` +
+        `<div>Time: ${new Date(sample.timestamp).toLocaleTimeString()}</div>` +
+        `<div>Lat: ${sample.latitude.toFixed(6)}, Lng: ${sample.longitude.toFixed(6)}</div>` +
+        `<div>Reported GPS Accuracy: ±${Math.round(sample.accuracy)} m</div>` +
+        `<hr style="border:none;border-top:1px solid #ddd;margin:6px 0"/>` +
+        `<div>Latency: ${formatVal('latency', sample.latencyMs, 'ms')}</div>` +
+        `<div>Download: ${formatVal('download', sample.downloadMbps, 'Mbps')}</div>` +
+        `<div>Upload: ${formatVal('upload', sample.uploadMbps, 'Mbps')}</div>` +
+        `<div>Jitter: ${formatVal('jitter', sample.jitterMs, 'ms')}</div>` +
+        `<div>HTTP failure: ${formatVal('probeFailure', sample.probeFailurePercent, '%')}</div>` +
+        `<div>Save state: ${sample.throughputTestPerformed ? 'Eligible for persistence' : 'Live sample (session streaming)'}</div>` +
+        `</div>`;
+      const info = new google.maps.InfoWindow({ content: infoContent });
+      marker.addListener('click', () => info.open({ map, anchor: marker }));
+      livePointMarkersRef.current.push(marker);
     }
   }, [liveMeasurements, loading]);
 
@@ -697,6 +757,8 @@ export const CampusMap: React.FC<CampusMapProps> = ({
       }
       polylineSegmentsRef.current.forEach((p) => p.setMap(null));
       polylineSegmentsRef.current = [];
+      livePointMarkersRef.current.forEach((marker) => marker.setMap(null));
+      livePointMarkersRef.current = [];
       historicalMarkersRef.current.forEach((marker) => marker.setMap(null));
       historicalMarkersRef.current = [];
       findBestMarkerRef.current?.setMap(null);

@@ -1,8 +1,13 @@
 import type { LiveMeasurement, MeasurementMethodVersion, NetworkStatus, TelecomOperator } from '../types';
 
 export const MEASUREMENT_METHOD_VERSION: MeasurementMethodVersion = 'quality-v2';
-/** Require at least 70% of the formula's original weight to be backed by valid metrics. */
-export const MIN_NQS_AVAILABLE_WEIGHT = 0.70;
+export const NQS_BROWSER_WEIGHTS = {
+  latency: 0.2941,
+  throughput: 0.3529,
+  probeFailure: 0.2353,
+  jitter: 0.1176,
+  signal: 0
+} as const;
 
 export interface MeasurementConfig {
   /** Base URL of the measurement server (e.g. 'http://localhost:3001') */
@@ -440,9 +445,7 @@ export class NetworkMeasurerService {
       download: this.hasDownloadMeasurement,
       upload: this.hasUploadMeasurement,
       jitter: isSuccess && hasPreviousLatency,
-      // Wait for a complete rolling window so startup percentages are not based on one or two
-      // probes and don't jump in misleading 50%/100% increments.
-      probeFailure: this.pingHistory.length >= this.config.maxProbeHistory,
+      probeFailure: this.pingHistory.length > 0,
       signal: false
     };
     const scoreResult = this.calculateNqs({
@@ -493,6 +496,7 @@ export class NetworkMeasurerService {
       measurementMethodVersion: MEASUREMENT_METHOD_VERSION,
       throughputTestPerformed,
       isOffline: false,
+      isProvisional: scoreResult.isProvisional,
       metricAvailability: availability,
       nqsComponents: { ...scores, raw: rawNqs }
     };
@@ -567,23 +571,36 @@ export class NetworkMeasurerService {
     probeFailurePercent: number;
     jitterMs: number;
     availability: { latency: boolean; download: boolean; probeFailure: boolean; jitter: boolean };
-  }): { nqs: number; raw: number | null; available: boolean; availableWeight: number; scores: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null } } {
+  }): { nqs: number; raw: number | null; available: boolean; availableWeight: number; isProvisional: boolean; scores: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null } } {
     const scores = {
       latency: input.availability.latency && Number.isFinite(input.latencyMs) && input.latencyMs >= 0 && input.latencyMs <= 600000 ? this.calcLatencyScore(input.latencyMs) : null,
       throughput: input.availability.download && Number.isFinite(input.downloadMbps) && input.downloadMbps >= 0 && input.downloadMbps <= 100000 ? this.calcThroughputScore(input.downloadMbps) : null,
       probeFailure: input.availability.probeFailure && Number.isFinite(input.probeFailurePercent) && input.probeFailurePercent >= 0 && input.probeFailurePercent <= 100 ? this.calcProbeFailureScore(input.probeFailurePercent) : null,
       jitter: input.availability.jitter && Number.isFinite(input.jitterMs) && input.jitterMs >= 0 && input.jitterMs <= 600000 ? this.calcJitterScore(input.jitterMs) : null
     };
-    const weights = { latency: 0.25, throughput: 0.30, probeFailure: 0.20, jitter: 0.10 } as const;
+    const weights = NQS_BROWSER_WEIGHTS;
     let numerator = 0;
     let denominator = 0;
-    for (const key of Object.keys(weights) as Array<keyof typeof weights>) {
+    let availableCount = 0;
+    for (const key of ['latency', 'throughput', 'probeFailure', 'jitter'] as const) {
       const score = scores[key];
-      if (score !== null) { numerator += weights[key] * score; denominator += weights[key]; }
+      if (score !== null) {
+        numerator += weights[key] * score;
+        denominator += weights[key];
+        availableCount++;
+      }
     }
     const raw = denominator > 0 ? numerator / denominator : null;
-    const available = raw !== null && denominator >= MIN_NQS_AVAILABLE_WEIGHT;
-    return { nqs: !available ? 0 : Math.min(100, Math.max(0, Math.round(raw!))), raw: available ? raw : null, available, availableWeight: denominator, scores };
+    const available = raw !== null && denominator > 0;
+    const isProvisional = available && availableCount < 4;
+    return {
+      nqs: !available ? 0 : Math.min(100, Math.max(0, Math.round(raw!))),
+      raw: available ? raw : null,
+      available,
+      availableWeight: denominator,
+      isProvisional,
+      scores
+    };
   }
 
   public getNqsStatus(nqs: number | null): NetworkStatus {
