@@ -29,7 +29,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab = 'find', onSelectTab 
         <div style={styles.statusGroup} className="site-status">
           <div style={styles.statusIndicator}>
             <span style={styles.statusDot} />
-            <span style={styles.statusText}>MOCK TELEMETRY ONLINE</span>
+            <span style={styles.statusText}>NETWORK QUALITY MONITOR</span>
           </div>
         </div>
 

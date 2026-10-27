@@ -8,12 +8,14 @@ import { MetricsCard } from './components/MetricsCard';
 import { LiveMeasurementCard } from './components/LiveMeasurementCard';
 import { SecondaryFeatures } from './components/SecondaryFeatures';
 import { Footer } from './components/Footer';
+import { AccessibleDialog } from './components/AccessibleDialog';
+import { OPERATORS } from './data/mockData';
 import { networkMeasurer } from './services/networkMeasurer';
 import { loadMeasurements, loadLatestMeasurementForOperator, saveMeasurement } from './services/measurementApi';
 import { loadAllMeasurementsForOperator } from './services/measurementApi';
 import { Info, X } from 'lucide-react';
 import type { HistoryStatus, OperatorFilter } from './services/historicalMeasurements';
-import { findBestSpot, type BestSpotResult } from './services/bestSpot';
+import { refreshAndSearchAfterSave, searchPersistedBestSpot, type PersistedBestSpotSearchResult } from './services/bestSpot';
 import { importLibrary } from '@googlemaps/js-api-loader';
 import { requestWalkingRoutesWith, type WalkingRouteOption, type RouteCoordinate, type ComputeRoutes } from './services/walkingRoutes';
 import { isValidCurrentRouteOrigin } from './services/walkingRoutes';
@@ -22,7 +24,11 @@ import { calculateRouteRankings } from './services/routeRanking';
 import { advanceOffRouteFixCount, calculateRouteProgress, canRequestReroute, endNavigationSession, isGpsJump, startNavigationSession, validateNavigationFix, type NavigationGpsFix, type RouteProgress } from './services/liveNavigation';
 import { findNearbyMeasurements, type MapSearchResult } from './services/mapLocationSearch';
 import { selectTelemetryMeasurement } from './services/measurementTelemetry';
-import { measurementGpsMessage, shouldPersistMeasurement, validateMeasurementGps } from './services/measurementValidation';
+import { measurementGpsAccuracyWarning, measurementGpsMessage, validateMeasurementGps, validateMeasurementStart } from './services/measurementValidation';
+import { confirmMeasurementSave, getMeasurementStorageEligibility } from './services/measurementPersistence';
+import type { LocationTrackerStatus } from './services/locationTracker';
+import { getLocationPromptForAction } from './services/locationAccess';
+import { SequentialMeasurementLoop } from './services/measurementLoop';
 import type { RoutePickMode } from './components/RoutePlannerPanel';
 
 // Helper function to calculate geographic distance in meters between 2 coordinates (Haversine formula)
@@ -52,13 +58,21 @@ export function App() {
   const [historyStatus, setHistoryStatus] = useState<HistoryStatus>('loading');
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyOperator, setHistoryOperator] = useState<OperatorFilter>('All');
-  const [findBestSpotState, setFindBestSpotState] = useState<BestSpotResult | { status: 'idle' | 'history-loading' | 'history-error' }>({ status: 'idle' });
+  const [findBestSpotState, setFindBestSpotState] = useState<PersistedBestSpotSearchResult | { status: 'idle' | 'history-loading' }>({ status: 'idle' });
+  const [measurementDialogOpen, setMeasurementDialogOpen] = useState(false);
+  const [findOperatorDialogOpen, setFindOperatorDialogOpen] = useState(false);
+  const [activeLocationPrompt, setActiveLocationPrompt] = useState<'measure' | 'best-spot' | null>(null);
+  const [locationPromptError, setLocationPromptError] = useState<string | null>(null);
+  const [hasExplicitOperatorSelection, setHasExplicitOperatorSelection] = useState(false);
+  const [measurementOperatorChoice, setMeasurementOperatorChoice] = useState<TelecomOperator>('Jio');
+  const [measurementStartError, setMeasurementStartError] = useState<string | null>(null);
+  const [firstMeasurePromptOpen, setFirstMeasurePromptOpen] = useState(false);
   const [navigationActive, setNavigationActive] = useState(false);
   const [liveNavigationActive, setLiveNavigationActive] = useState(false);
   const [navigationProgress, setNavigationProgress] = useState<RouteProgress | null>(null);
   const [navigationGpsMessage, setNavigationGpsMessage] = useState('');
   const [navigationOffRoute, setNavigationOffRoute] = useState(false);
-  const [locationStatus, setLocationStatus] = useState<{ status: 'idle' | 'locating' | 'active' | 'denied' | 'error'; message: string | null }>({ status: 'idle', message: null });
+  const [locationStatus, setLocationStatus] = useState<{ status: LocationTrackerStatus; message: string | null }>({ status: 'idle', message: null });
   const [rerouteState, setRerouteState] = useState<'idle' | 'loading' | 'error' | 'ready'>('idle');
   const [rerouteError, setRerouteError] = useState<string | null>(null);
   const [rerouteRoutes, setRerouteRoutes] = useState<WalkingRouteOption[]>([]);
@@ -79,6 +93,7 @@ export function App() {
   const [gpsFix, setGpsFix] = useState<{ lat: number; lng: number; accuracy: number; timestamp: number } | null>(null);
   const [gpsFreshnessClock, setGpsFreshnessClock] = useState(Date.now());
   const [currentMeasurement, setCurrentMeasurement] = useState<LiveMeasurement | null>(null);
+  const [currentMeasurementStorage, setCurrentMeasurementStorage] = useState<{ measurementId: string; status: 'score-ineligible' | 'persistence-ineligible' | 'pending' | 'saved' | 'failed' | 'unknown'; error?: string } | null>(null);
   const [persistedTelemetry, setPersistedTelemetry] = useState<{ status: HistoryStatus; error: string | null; measurement: LiveMeasurement | null }>({ status: 'loading', error: null, measurement: null });
   const [mapSearchSelection, setMapSearchSelection] = useState<MapSearchResult | null>(null);
   const [nearbySearchMeasurements, setNearbySearchMeasurements] = useState<Array<{ measurement: LiveMeasurement; distanceMeters: number }>>([]);
@@ -101,7 +116,9 @@ export function App() {
   const sessionDistanceRef = useRef<number>(0);
   const lastAcceptedGpsRef = useRef<{ lat: number; lng: number } | null>(null);
   const sessionStartTimeRef = useRef<number>(0);
-  const measurementTimerRef = useRef<number | null>(null);
+  const measurementLoopRef = useRef<SequentialMeasurementLoop | null>(null);
+  const gpsPauseReasonRef = useRef<string | null>(null);
+  const measurementCycleFailureCountRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const storageIssueShownRef = useRef(false);
   const locationRetryRef = useRef<() => void>(() => undefined);
@@ -117,6 +134,10 @@ export function App() {
   const lastRerouteAtRef = useRef(0);
   const telemetryRequestRef = useRef(0);
   const nearbySearchRequestRef = useRef(0);
+  const bestSpotRequestRef = useRef(0);
+  const bestSpotRequestedOperatorRef = useRef<TelecomOperator | null>(null);
+  const rerunBestSpotRef = useRef<((showFirstMeasurePrompt?: boolean) => Promise<PersistedBestSpotSearchResult | null>) | null>(null);
+  const searchAfterSaveRef = useRef(false);
 
   useEffect(() => {
     selectedOperatorRef.current = selectedOperator;
@@ -127,6 +148,17 @@ export function App() {
       setFindBestSpotState({ status: 'idle' });
     }
   }, [findBestSpotState, selectedOperator]);
+
+  const previousOperatorRef = useRef(selectedOperator);
+  useEffect(() => {
+    if (previousOperatorRef.current === selectedOperator) return;
+    previousOperatorRef.current = selectedOperator;
+    if (bestSpotRequestedOperatorRef.current !== selectedOperator) {
+      bestSpotRequestRef.current++;
+      setFirstMeasurePromptOpen(false);
+      setFindBestSpotState({ status: 'idle' });
+    }
+  }, [selectedOperator]);
 
   const refreshHistoricalMeasurements = useCallback(async (): Promise<LiveMeasurement[] | null> => {
     setHistoryStatus('loading');
@@ -257,29 +289,52 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!navigationActive) return;
     const timer = window.setInterval(() => setGpsFreshnessClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [navigationActive]);
+  }, []);
+
+  const locationGateStatus = validateMeasurementGps(gpsFix, gpsFreshnessClock);
+  // A fresh, valid fix is usable independently of permission state and reported confidence.
+  // Permission/watch errors affect the status banner, never overall app access.
+  const locationIsUsable = locationGateStatus === 'ready';
+  const locationAccuracyWarning = measurementGpsAccuracyWarning(gpsFix);
+  const locationStatusLabel = locationStatus.status === 'denied'
+    ? `Location permission denied. Enable it in browser site settings.${locationIsUsable ? ` Last fix remains fresh (±${Math.round(gpsFix!.accuracy)} m).` : ''}`
+    : locationStatus.status === 'unavailable' || locationStatus.status === 'timeout'
+      ? `Location temporarily unavailable.${locationIsUsable ? ` Last fix remains fresh (±${Math.round(gpsFix!.accuracy)} m).` : ' Check device location services or retry.'}`
+    : locationIsUsable
+      ? locationAccuracyWarning ? locationAccuracyWarning : `Location ready · GPS accuracy ±${Math.round(gpsFix!.accuracy)} m.`
+    : locationIsUsable
+      ? locationAccuracyWarning ? locationAccuracyWarning : `Location ready · GPS accuracy ±${Math.round(gpsFix!.accuracy)} m.`
+      : locationGateStatus === 'stale'
+        ? 'Location is stale. Waiting for a fresh position.'
+        : locationGateStatus === 'invalid'
+          ? 'Location unavailable: the latest coordinates or accuracy are invalid.'
+          : locationStatus.status === 'unsupported'
+            ? 'This browser does not support location access.'
+            : locationStatus.status === 'error'
+              ? locationStatus.message ?? 'Location could not be read. Retry when needed.'
+              : 'Locating…';
 
   const currentGpsReady = isValidCurrentRouteOrigin(gpsFix, gpsFreshnessClock);
   const currentGpsMessage = !gpsFix ? 'No GPS fix has been reported.' : !isValidCurrentRouteOrigin(gpsFix)
     ? gpsFix.accuracy > 50 ? 'GPS accuracy must be 50 metres or better.' : 'No fresh GPS fix. Location permission may be denied; use map points or enable location access.'
     : 'Use the current GPS location as origin.';
   const navigationDisplayMessage = !liveNavigationActive ? (() => {
-    if (locationStatus.status === 'denied' || locationStatus.status === 'error') return locationStatus.message ?? 'Location is unavailable.';
-    if (locationStatus.status === 'locating' || locationStatus.status === 'idle') return 'Waiting for GPS location.';
+    if (['denied', 'error', 'unsupported', 'unavailable', 'timeout'].includes(locationStatus.status)) return locationStatus.message ?? 'Location is unavailable.';
+    if (['locating', 'requesting', 'idle'].includes(locationStatus.status)) return 'Waiting for GPS location.';
     const gpsStatus = validateNavigationFix(gpsFix, gpsFreshnessClock);
-    return gpsStatus === 'ready' ? `GPS available · accuracy ±${Math.round(gpsFix!.accuracy)} m.` : gpsStatus === 'inaccurate' ? `GPS accuracy ±${Math.round(gpsFix!.accuracy)} m is not precise enough.` : 'GPS location is stale. Waiting for a fresh fix.';
+    return gpsStatus === 'ready' ? `GPS available · accuracy ±${Math.round(gpsFix!.accuracy)} m.` : gpsStatus === 'invalid' ? 'The browser returned invalid GPS data. Retry location access.' : gpsStatus === 'missing' ? 'Waiting for a GPS fix.' : 'GPS location is stale. Waiting for a fresh fix.';
   })() : (() => {
     const gpsStatus = validateNavigationFix(gpsFix, gpsFreshnessClock);
     if (gpsStatus === 'ready') return navigationGpsMessage || `GPS active · accuracy ±${Math.round(gpsFix!.accuracy)} m.`;
+    if (gpsStatus === 'invalid') return 'The browser returned invalid GPS data. Retry location access.';
     if (gpsStatus === 'inaccurate') return `GPS accuracy ±${Math.round(gpsFix!.accuracy)} m is too wide for navigation progress.`;
-    if (locationStatus.status === 'denied' || locationStatus.status === 'error') return locationStatus.message ?? 'Location is unavailable. Check browser location settings.';
+    if (['denied', 'error', 'unsupported', 'unavailable', 'timeout'].includes(locationStatus.status)) return locationStatus.message ?? 'Location is unavailable. Check browser location settings.';
     return gpsStatus === 'missing' ? 'Waiting for a GPS fix. Allow location access in browser settings.' : 'GPS location is stale. Waiting for a fresh fix.';
   })();
 
-  const handleLocationStatusChange = useCallback((status: 'idle' | 'locating' | 'active' | 'denied' | 'error', message: string | null) => {
+  const handleLocationStatusChange = useCallback((status: LocationTrackerStatus, message: string | null) => {
     setLocationStatus({ status, message });
   }, []);
 
@@ -519,8 +574,8 @@ export function App() {
   };
 
   // Start Live Measurement Session
-  const handleStartMeasuring = () => {
-    if (isMeasuring) return;
+  const beginMeasurementSession = (operator: TelecomOperator) => {
+    if (isMeasuringRef.current) return;
     if (!networkMeasurer.getConfig().serverUrl) {
       showToast('Measurement server is not configured. Set VITE_MEASUREMENT_SERVER_URL to the HTTPS Render URL and rebuild the frontend.');
       return;
@@ -531,12 +586,12 @@ export function App() {
       showToast(`${measurementGpsMessage(gpsStatus)} Allow location access or use the map’s retry control.`);
       return;
     }
+    selectedOperatorRef.current = operator;
+    setSelectedOperator(operator);
 
-    // Cancel any previous timers and abort pending requests
-    if (measurementTimerRef.current !== null) {
-      clearTimeout(measurementTimerRef.current);
-      measurementTimerRef.current = null;
-    }
+    // A completed prior run cannot leave a scheduled cycle behind.
+    measurementLoopRef.current?.stop();
+    measurementLoopRef.current = null;
     if (abortControllerRef.current !== null) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -547,7 +602,10 @@ export function App() {
     setIsMeasuring(true);
     setLiveMeasurements([]);
     setCurrentMeasurement(null);
+    setCurrentMeasurementStorage(null);
     setSessionSummary(null);
+    gpsPauseReasonRef.current = null;
+    measurementCycleFailureCountRef.current = 0;
 
     networkMeasurer.resetSession();
     sessionDistanceRef.current = 0;
@@ -565,71 +623,166 @@ export function App() {
       elem.scrollIntoView({ behavior: 'smooth' });
     }
 
-    // Sequential async measurement loop (prevents overlapping requests)
-    const executeStep = async () => {
-      if (!isMeasuringRef.current || controller.signal.aborted) return;
-
-      try {
+    // Each cycle settles before the next timer is armed. Rerenders do not own this loop.
+    const loop = new SequentialMeasurementLoop({
+      intervalMs: 1000,
+      schedule: (callback, delay) => window.setTimeout(callback, delay),
+      cancel: (timer) => window.clearTimeout(timer as number),
+      runCycle: async (cycleNumber) => {
+        if (!isMeasuringRef.current || controller.signal.aborted) return 'skipped';
         const currentGps = userGpsRef.current;
         const gpsStatus = validateMeasurementGps(currentGps);
         if (gpsStatus !== 'ready' || !currentGps) {
-          showToast(`${measurementGpsMessage(gpsStatus)} Measurement stopped to avoid saving an uncertain location.`);
-          handleStopMeasuring();
-          return;
+          if (gpsPauseReasonRef.current !== gpsStatus) {
+            gpsPauseReasonRef.current = gpsStatus;
+            showToast(`${measurementGpsMessage(gpsStatus)} Measurement is paused until a fresh, valid location returns.`);
+          }
+          if (import.meta.env.DEV) console.debug(`[NETNAV MEASURE] cycle ${cycleNumber} skipped; waiting for valid GPS (${gpsStatus})`);
+          return 'skipped';
         }
+        gpsPauseReasonRef.current = null;
+
         const { lat, lng, accuracy, speed, heading } = currentGps;
+        const sample = await networkMeasurer.measureSample(lat, lng, accuracy, selectedOperatorRef.current, heading, speed, controller.signal);
 
-        const sample = await networkMeasurer.measureSample(
-          lat,
-          lng,
-          accuracy,
-          selectedOperatorRef.current,
-          heading,
-          speed,
-          controller.signal
-        );
-
-        if (validateMeasurementGps(userGpsRef.current) !== 'ready') {
-          showToast('GPS became stale or too inaccurate during the measurement. The sample was discarded to avoid attaching it to an uncertain location.');
-          handleStopMeasuring();
-          return;
+        // A slow cycle can outlive the GPS fix. Discard it, but keep the session alive for a new fix.
+        const measurementFixStatus = validateMeasurementGps(currentGps);
+        const completionGpsStatus = validateMeasurementGps(userGpsRef.current);
+        if (measurementFixStatus !== 'ready' || completionGpsStatus !== 'ready') {
+          const invalidStatus = measurementFixStatus !== 'ready' ? measurementFixStatus : completionGpsStatus;
+          if (gpsPauseReasonRef.current !== invalidStatus) {
+            gpsPauseReasonRef.current = invalidStatus;
+            showToast('The GPS fix associated with this sample became stale or invalid. This sample was discarded; measuring will resume with a fresh fix.');
+          }
+          if (import.meta.env.DEV) console.debug(`[NETNAV MEASURE] cycle ${cycleNumber} discarded; measurement-start or current GPS is invalid (${invalidStatus})`);
+          return 'skipped';
         }
+        if (!isMeasuringRef.current || controller.signal.aborted) return 'skipped';
 
-        // Discard sample if user clicked Stop while awaiting measurement
-        if (!isMeasuringRef.current || controller.signal.aborted) {
-          return;
-        }
-
+        const storageEligibility = getMeasurementStorageEligibility(sample);
+        const eligibleForStorage = storageEligibility === 'pending';
         setCurrentMeasurement(sample);
+        setCurrentMeasurementStorage({ measurementId: sample.id, status: storageEligibility });
         setLiveMeasurements((prev) => [...prev, sample]);
-        if (shouldPersistMeasurement(sample)) {
-          try {
-            await saveMeasurement(sample);
-            routeHistoryCacheRef.current.delete(sample.operator);
-            storageIssueShownRef.current = false;
-          } catch (error) {
-            console.warn('[NETNAV STORAGE] Sample was measured, but saving it to history failed. Network measurement remains valid:', error);
+        if (eligibleForStorage) {
+          const saveResult = await confirmMeasurementSave(() => saveMeasurement(sample, controller.signal));
+          if (saveResult.status === 'failed') {
+            if (controller.signal.aborted) {
+              setCurrentMeasurementStorage((current) => current?.measurementId === sample.id ? { measurementId: sample.id, status: 'unknown', error: 'Request was cancelled; verify history before retrying.' } : current);
+              return 'skipped';
+            }
+            const message = saveResult.error;
+            setCurrentMeasurementStorage((current) => current?.measurementId === sample.id ? { measurementId: sample.id, status: 'failed', error: message } : current);
+            console.warn('[NETNAV STORAGE] Sample was measured, but saving it to history failed. Network measurement remains valid:', message);
             if (!storageIssueShownRef.current) {
-              showToast('Measurement collected, but saving to Neon failed. See the console and local API server output for details.');
+              showToast(`Measurement collected but not saved: ${message}`);
               storageIssueShownRef.current = true;
             }
+            return;
           }
+          setCurrentMeasurementStorage((current) => current?.measurementId === sample.id ? { measurementId: sample.id, status: 'saved' } : current);
+          routeHistoryCacheRef.current.delete(sample.operator);
+          storageIssueShownRef.current = false;
+          if (searchAfterSaveRef.current) {
+            searchAfterSaveRef.current = false;
+            try {
+              const refreshedResult = await refreshAndSearchAfterSave(
+                async () => { await refreshHistoricalMeasurements(); },
+                () => routeHistoryCacheRef.current.delete(sample.operator),
+                async () => await rerunBestSpotRef.current?.(false) ?? null
+              );
+              if (refreshedResult?.status !== 'success') {
+                showToast('The saved sample is not yet eligible as a verified nearby spot. Keep measuring or retry the search after another sample.');
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : 'History refresh failed';
+              console.warn('[NETNAV STORAGE] Measurement save was confirmed, but the follow-up history/search refresh failed:', message);
+              showToast(`Measurement saved, but history could not be refreshed: ${message}`);
+            }
+          }
+        } else if (searchAfterSaveRef.current && sample.throughputTestPerformed) {
+          showToast('This cycle did not produce an eligible scored record. The area search will retry after the next valid saved measurement.');
         }
-      } catch (err: unknown) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return; // Normal session cancellation
+        return;
+      },
+      onCycleError: (error, cycleNumber) => {
+        if (error instanceof Error && error.name === 'AbortError') return;
+        measurementCycleFailureCountRef.current++;
+        if (import.meta.env.DEV && (measurementCycleFailureCountRef.current === 1 || measurementCycleFailureCountRef.current % 10 === 0)) {
+          console.warn(`[NETNAV MEASURE] cycle ${cycleNumber} failed (${measurementCycleFailureCountRef.current} consecutive failure(s)); loop will retry`, error instanceof Error ? error.message : String(error));
         }
-        console.warn('[NETNAV] Measurement error:', err);
+      },
+      onCycleSettled: (outcome, cycleNumber) => {
+        if (outcome !== 'failed') measurementCycleFailureCountRef.current = 0;
+        if (import.meta.env.DEV) console.debug(`[NETNAV MEASURE] cycle ${cycleNumber} ${outcome}`);
       }
+    });
+    measurementLoopRef.current = loop;
+    loop.start();
+  };
 
-      // Schedule next tick only if still measuring and not aborted
-      if (isMeasuringRef.current && !controller.signal.aborted) {
-        measurementTimerRef.current = window.setTimeout(executeStep, 1000);
-      }
-    };
+  const openMeasurementSelection = () => {
+    const prompt = getLocationPromptForAction('measure', locationIsUsable);
+    if (prompt) {
+      setLocationPromptError(null);
+      setActiveLocationPrompt(prompt);
+      return;
+    }
+    setLocationPromptError(null);
+    setActiveLocationPrompt(null);
+    setMeasurementOperatorChoice(selectedOperatorRef.current);
+    setMeasurementStartError(null);
+    setMeasurementDialogOpen(true);
+  };
 
-    // Execute first sample
-    executeStep();
+  const handleStartMeasuring = () => {
+    if (isMeasuringRef.current || measurementDialogOpen) return;
+    const prompt = getLocationPromptForAction('measure', locationIsUsable);
+    if (prompt) {
+      setLocationPromptError(null);
+      setActiveLocationPrompt(prompt);
+      return;
+    }
+    openMeasurementSelection();
+  };
+
+  const confirmMeasurementStart = () => {
+    const gpsStatus = validateMeasurementStart(measurementOperatorChoice, userGpsRef.current, gpsFreshnessClock);
+    if (gpsStatus === 'operator-required') {
+      setMeasurementStartError('Select Jio, Airtel, Vi, or BSNL before measuring.');
+      return;
+    }
+    if (gpsStatus !== 'ready' || !locationIsUsable) {
+      setMeasurementDialogOpen(false);
+      setLocationPromptError(gpsStatus !== 'ready' ? measurementGpsMessage(gpsStatus) : 'Waiting for a current location fix.');
+      setActiveLocationPrompt('measure');
+      return;
+    }
+    if (!networkMeasurer.getConfig().serverUrl) {
+      setMeasurementStartError('Measurement server is not configured. Set VITE_MEASUREMENT_SERVER_URL to the HTTPS Render URL and rebuild.');
+      return;
+    }
+    const operator = measurementOperatorChoice;
+    setSelectedOperator(operator);
+    selectedOperatorRef.current = operator;
+    bestSpotRequestedOperatorRef.current = null;
+    setHistoryOperator(operator);
+    setHasExplicitOperatorSelection(true);
+    setMeasurementDialogOpen(false);
+    beginMeasurementSession(operator);
+  };
+
+  const handleOperatorSelected = (operator: TelecomOperator) => {
+    if (isMeasuringRef.current) {
+      showToast('Stop the current measurement session before changing its network label.');
+      return;
+    }
+    selectedOperatorRef.current = operator;
+    bestSpotRequestedOperatorRef.current = null;
+    setSelectedOperator(operator);
+    setHistoryOperator(operator);
+    setHasExplicitOperatorSelection(true);
+    showToast(`Selected network label changed to ${operator}. The browser does not verify the serving SIM.`);
   };
 
   // Stop Live Measurement Session
@@ -638,12 +791,10 @@ export function App() {
 
     isMeasuringRef.current = false;
     setIsMeasuring(false);
-
-    // Cancel scheduled timer
-    if (measurementTimerRef.current !== null) {
-      clearTimeout(measurementTimerRef.current);
-      measurementTimerRef.current = null;
-    }
+    const stoppedLoop = measurementLoopRef.current;
+    stoppedLoop?.stop();
+    measurementLoopRef.current = null;
+    if (import.meta.env.DEV) console.info(`[NETNAV MEASURE] session stopped explicitly after ${stoppedLoop?.cycleCount ?? 0} cycle(s)`);
 
     // Abort in-flight requests immediately
     if (abortControllerRef.current !== null) {
@@ -699,9 +850,10 @@ export function App() {
   // Cleanup timers and abort controllers on unmount
   useEffect(() => {
     return () => {
-      if (measurementTimerRef.current !== null) {
-        clearTimeout(measurementTimerRef.current);
-      }
+      if (isMeasuringRef.current && import.meta.env.DEV) console.info('[NETNAV MEASURE] session ended because the application component unmounted; active requests were aborted');
+      isMeasuringRef.current = false;
+      measurementLoopRef.current?.stop();
+      measurementLoopRef.current = null;
       if (abortControllerRef.current !== null) {
         abortControllerRef.current.abort();
       }
@@ -713,24 +865,77 @@ export function App() {
     };
   }, []);
 
-  const runBestSpotSearch = (records = historicalMeasurements) => {
-    if (historyStatus === 'loading') {
-      setFindBestSpotState({ status: 'history-loading' });
-      return;
+  const runBestSpotSearch = async (showFirstMeasurePrompt = true, operatorOverride?: TelecomOperator): Promise<PersistedBestSpotSearchResult | null> => {
+    const requestId = ++bestSpotRequestRef.current;
+    const operator = operatorOverride ?? selectedOperator;
+    bestSpotRequestedOperatorRef.current = operator;
+    setFindBestSpotState({ status: 'history-loading' });
+    setFirstMeasurePromptOpen(false);
+    const result = await searchPersistedBestSpot(async () => {
+      let history = routeHistoryCacheRef.current.get(operator);
+      if (!history) {
+        history = await loadAllMeasurementsForOperator(operator, 20_000);
+        routeHistoryCacheRef.current.set(operator, history);
+      }
+      return history;
+    }, operator, userGpsRef.current, gpsFreshnessClock);
+    if (requestId !== bestSpotRequestRef.current || selectedOperatorRef.current !== operator) return null;
+    if (result.status === 'gps-unavailable' || result.status === 'gps-stale' || result.status === 'gps-invalid') {
+      setFindBestSpotState(result);
+      setFirstMeasurePromptOpen(false);
+      return result;
     }
-    if (historyStatus === 'error') {
-      setFindBestSpotState({ status: 'history-error' });
-      return;
-    }
-    setFindBestSpotState(findBestSpot(records, selectedOperator, userGpsRef.current));
+    if (result.status === 'history-error') console.warn(`[NETNAV BEST SPOT] ${operator} history request failed:`, result.message);
+    setFindBestSpotState(result);
+    if (result.status === 'no-data' && showFirstMeasurePrompt) setFirstMeasurePromptOpen(true);
+    return result;
   };
+  rerunBestSpotRef.current = runBestSpotSearch;
 
-  const handleFindBestSpot = () => {
-    runBestSpotSearch();
+  const startFindBestSpotFlow = () => {
+    if (!hasExplicitOperatorSelection) {
+      setMeasurementOperatorChoice(selectedOperator);
+      setFindOperatorDialogOpen(true);
+      return;
+    }
+    void runBestSpotSearch();
     const element = document.getElementById('results-section');
     if (element) {
       element.scrollIntoView({ behavior: 'smooth' });
     }
+  };
+
+  const handleFindBestSpot = () => {
+    const prompt = getLocationPromptForAction('best-spot', locationIsUsable);
+    if (prompt) {
+      setLocationPromptError(null);
+      setActiveLocationPrompt(prompt);
+      return;
+    }
+    startFindBestSpotFlow();
+  };
+
+  const retryLocationFromPrompt = () => {
+    setLocationPromptError(null);
+    locationRetryRef.current();
+  };
+
+  const dismissLocationPrompt = () => {
+    if (activeLocationPrompt === 'measure') searchAfterSaveRef.current = false;
+    setActiveLocationPrompt(null);
+    setLocationPromptError(null);
+  };
+
+  const continueLocationAction = () => {
+    const action = activeLocationPrompt;
+    if (!locationIsUsable || !action) {
+      setLocationPromptError('A fresh, valid GPS fix is not available yet. Retry or cancel.');
+      return;
+    }
+    setActiveLocationPrompt(null);
+    setLocationPromptError(null);
+    if (action === 'measure') openMeasurementSelection();
+    else startFindBestSpotFlow();
   };
 
   const showToast = (msg: string) => {
@@ -762,15 +967,19 @@ export function App() {
         }}
       />
 
+      <div role="status" aria-live="polite" style={dialogStyles.locationStatus}>
+        <span>{locationIsUsable && locationAccuracyWarning ? locationAccuracyWarning : locationStatusLabel}</span>
+        {(!locationIsUsable || ['denied', 'unavailable', 'timeout', 'error'].includes(locationStatus.status)) && <button type="button" style={dialogStyles.locationRetry} onClick={() => locationRetryRef.current()} disabled={locationStatus.status === 'requesting'}>
+          {locationStatus.status === 'requesting' ? 'Requesting…' : 'Enable / retry location'}
+        </button>}
+      </div>
+
       {/* Main Content Layout */}
       <main style={styles.mainContent} className="main-content">
         {/* HERO AREA: Primary Feature (FIND BEST SPOT) */}
         <HeroSection
           selectedOperator={selectedOperator}
-          onSelectOperator={(op) => {
-            setSelectedOperator(op);
-            showToast(`Selected Network Operator changed to ${op}.`);
-          }}
+          onSelectOperator={handleOperatorSelected}
           onFindBestSpotClick={handleFindBestSpot}
         />
 
@@ -851,6 +1060,8 @@ export function App() {
             }}
             liveMeasurements={liveMeasurements}
             isMeasuring={isMeasuring}
+            locationFresh={locationIsUsable}
+            locationHasFix={gpsFix !== null}
             sessionSummary={sessionSummary}
             onUserLocationChange={handleUserLocationChange}
           />
@@ -861,6 +1072,7 @@ export function App() {
           <LiveMeasurementCard
             isMeasuring={isMeasuring}
             currentMeasurement={currentMeasurement}
+            storageState={currentMeasurementStorage?.measurementId === currentMeasurement?.id ? currentMeasurementStorage : null}
             measurementCount={liveMeasurements.length}
             sessionSummary={sessionSummary}
             onStartMeasuring={handleStartMeasuring}
@@ -876,13 +1088,11 @@ export function App() {
               selectedOperator={selectedOperator}
               state={findBestSpotState}
               onMeasureLiveClick={handleStartMeasuring}
-              onRetrySearch={() => runBestSpotSearch()}
+              onRetrySearch={() => { void runBestSpotSearch(); }}
               onRetryLocation={() => locationRetryRef.current()}
-              onRetryHistory={async () => {
-                setFindBestSpotState({ status: 'history-loading' });
-                const rows = await refreshHistoricalMeasurements();
-                if (rows) setFindBestSpotState(findBestSpot(rows, selectedOperator, userGpsRef.current));
-                else setFindBestSpotState({ status: 'history-error' });
+              onRetryHistory={() => {
+                routeHistoryCacheRef.current.delete(selectedOperator);
+                void runBestSpotSearch();
               }}
             />
 
@@ -911,6 +1121,86 @@ export function App() {
           }}
         />
       </main>
+      {activeLocationPrompt && <AccessibleDialog title={activeLocationPrompt === 'measure' ? 'Location needed to measure' : 'Location needed to find a spot'} onClose={dismissLocationPrompt}>
+        <p style={dialogStyles.body}>{activeLocationPrompt === 'measure' ? 'A fresh browser location is needed to attach coordinates and reported GPS accuracy to a measurement.' : 'A fresh browser location is needed to search saved measurements around your GPS estimate.'}</p>
+        <p role="status" style={dialogStyles.notice}>{locationStatusLabel}</p>
+        {locationStatus.status === 'denied' && <p style={dialogStyles.caption}>Enable location for this site in browser settings. Device location services must also be enabled by you; this website cannot switch them on.</p>}
+        {!window.isSecureContext && <p style={dialogStyles.caption}>Geolocation may require HTTPS or localhost in this browser. NetNav cannot bypass browser security.</p>}
+        {locationPromptError && <p role="alert" style={dialogStyles.error}>{locationPromptError}</p>}
+        <div style={dialogStyles.actions}>
+          <button type="button" style={dialogStyles.primary} onClick={retryLocationFromPrompt} disabled={locationStatus.status === 'requesting'}>Retry Location</button>
+          {locationIsUsable && <button type="button" style={dialogStyles.primary} onClick={continueLocationAction}>Continue</button>}
+          <button type="button" style={dialogStyles.secondary} onClick={dismissLocationPrompt}>Cancel</button>
+        </div>
+      </AccessibleDialog>}
+
+      {findOperatorDialogOpen && <AccessibleDialog title="Choose a network for Find Best Spot" onClose={() => setFindOperatorDialogOpen(false)}>
+        <p style={dialogStyles.body}>Find Best Spot searches only saved measurements tagged with this selected network. NetNav does not detect the serving SIM.</p>
+        <fieldset style={dialogStyles.operatorList}>
+          <legend style={dialogStyles.caption}>Target network</legend>
+          {OPERATORS.map((operator) => <label key={operator.id} style={dialogStyles.operatorOption}>
+            <input type="radio" name="find-operator" value={operator.id} checked={measurementOperatorChoice === operator.id}
+              onChange={() => setMeasurementOperatorChoice(operator.id)} />
+            <span>{operator.name}</span>
+          </label>)}
+        </fieldset>
+        <p style={dialogStyles.caption}>The nominal search radius is 10 metres from the GPS estimate. The browser’s reported uncertainty may be larger than this radius.</p>
+        <div style={dialogStyles.actions}>
+          <button type="button" style={dialogStyles.primary} onClick={() => {
+            if (!locationIsUsable) {
+              setFindOperatorDialogOpen(false);
+              setActiveLocationPrompt('best-spot');
+              setLocationPromptError(null);
+              return;
+            }
+            const operator = measurementOperatorChoice;
+            selectedOperatorRef.current = operator;
+            setSelectedOperator(operator);
+            setHistoryOperator(operator);
+            setHasExplicitOperatorSelection(true);
+            setFindOperatorDialogOpen(false);
+            void runBestSpotSearch(true, operator);
+          }}>Search Nearby</button>
+          <button type="button" style={dialogStyles.secondary} onClick={() => setFindOperatorDialogOpen(false)}>Cancel</button>
+        </div>
+      </AccessibleDialog>}
+
+      {measurementDialogOpen && <AccessibleDialog title="Choose the network label to measure" onClose={() => {
+        setMeasurementDialogOpen(false); searchAfterSaveRef.current = false;
+      }}>
+        <p style={dialogStyles.body}>Select the network you want to associate with this measurement. NetNav does not independently detect which SIM or network carried the request.</p>
+        <fieldset style={dialogStyles.operatorList}>
+          <legend style={dialogStyles.caption}>Network</legend>
+          {OPERATORS.map((operator) => <label key={operator.id} style={dialogStyles.operatorOption}>
+            <input type="radio" name="measurement-operator" value={operator.id} checked={measurementOperatorChoice === operator.id}
+              onChange={() => { setMeasurementOperatorChoice(operator.id); setMeasurementStartError(null); }} />
+            <span>{operator.name}</span>
+          </label>)}
+        </fieldset>
+        <p style={dialogStyles.notice}>{locationIsUsable ? `Current GPS accuracy estimate: ±${Math.round(gpsFix!.accuracy)} m.` : locationStatusLabel}</p>
+        {measurementStartError && <p role="alert" style={dialogStyles.error}>{measurementStartError}</p>}
+        <div style={dialogStyles.actions}>
+          <button type="button" style={dialogStyles.primary} onClick={confirmMeasurementStart} disabled={isMeasuring}>Start Measuring</button>
+          <button type="button" style={dialogStyles.secondary} onClick={() => {
+            setMeasurementDialogOpen(false); searchAfterSaveRef.current = false;
+          }}>Cancel</button>
+        </div>
+      </AccessibleDialog>}
+
+      {firstMeasurePromptOpen && findBestSpotState.status === 'no-data' && <AccessibleDialog title="No verified measurement nearby" onClose={() => setFirstMeasurePromptOpen(false)}>
+        <p style={dialogStyles.body}>No verified measurement was found within the nominal 10-metre radius of your GPS estimate for {selectedOperator}. Be the first to measure this area?</p>
+        <p style={dialogStyles.caption}>Your current GPS uncertainty is approximately ±{Math.round(gpsFix?.accuracy ?? 0)} m, so the actual position may be outside that radius. Only saved quality-v2 records with a matching NQS calculation are considered.</p>
+        <div style={dialogStyles.actions}>
+          <button type="button" style={dialogStyles.primary} onClick={() => {
+            searchAfterSaveRef.current = true;
+            setFirstMeasurePromptOpen(false);
+            setMeasurementOperatorChoice(selectedOperator);
+            setMeasurementStartError(null);
+            openMeasurementSelection();
+          }} disabled={isMeasuring}>Start Measuring Here</button>
+          <button type="button" style={dialogStyles.secondary} onClick={() => setFirstMeasurePromptOpen(false)}>Cancel</button>
+        </div>
+      </AccessibleDialog>}
 
       {/* Futuristic UI Toast Notification */}
       {toastMessage && (
@@ -936,6 +1226,21 @@ export function App() {
 }
 
 export default App;
+
+const dialogStyles: Record<string, React.CSSProperties> = {
+  body: { color: '#CBD8E3', fontSize: '.92rem', lineHeight: 1.55 },
+  notice: { color: '#35F4FF', fontSize: '.84rem', lineHeight: 1.5, padding: 12, borderRadius: 8, border: '1px solid rgba(0,217,255,.25)', background: 'rgba(0,217,255,.06)' },
+  error: { color: '#FF9A9A', fontSize: '.82rem' },
+  caption: { color: '#9DB4C8', fontSize: '.76rem', lineHeight: 1.5 },
+  accuracyWarning: { position: 'sticky', top: 0, zIndex: 100, padding: '9px 16px', background: 'rgba(70,48,8,.96)', borderBottom: '1px solid rgba(255,211,106,.45)', color: '#FFE3A3', fontSize: '.82rem', lineHeight: 1.45, textAlign: 'center' },
+  locationStatus: { display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', gap: 10, padding: '7px 12px', background: 'rgba(8,22,39,.92)', borderBottom: '1px solid rgba(0,217,255,.18)', color: '#AFC4D5', fontSize: '.76rem', lineHeight: 1.4, textAlign: 'center' },
+  locationRetry: { minHeight: 30, padding: '3px 9px', border: '1px solid rgba(53,244,255,.45)', borderRadius: 6, background: 'rgba(0,217,255,.08)', color: '#35F4FF', fontSize: '.72rem', cursor: 'pointer' },
+  operatorList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(110px,1fr))', gap: 10, padding: 12, margin: '14px 0', border: '1px solid rgba(0,217,255,.2)', borderRadius: 8 },
+  operatorOption: { display: 'flex', alignItems: 'center', gap: 8, minHeight: 40, color: '#F5FAFF', cursor: 'pointer' },
+  actions: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, marginTop: 18 },
+  primary: { minHeight: 42, padding: '0 16px', border: '1px solid #35F4FF', borderRadius: 7, background: 'rgba(0,217,255,.12)', color: '#35F4FF', fontWeight: 700, cursor: 'pointer' },
+  secondary: { minHeight: 42, padding: '0 16px', border: '1px solid rgba(157,180,200,.45)', borderRadius: 7, background: 'transparent', color: '#CBD8E3', cursor: 'pointer' }
+};
 
 const styles: Record<string, React.CSSProperties> = {
   appWrapper: {

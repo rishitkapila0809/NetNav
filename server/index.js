@@ -47,6 +47,7 @@ const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB max upload limit
 const MAX_JSON_BYTES = 64 * 1024;
 const OPERATORS = new Set(['Jio', 'Airtel', 'Vi', 'BSNL']);
+const MIN_NQS_AVAILABLE_WEIGHT = 0.70;
 
 function metricScore(value, low, high) {
   if (value <= low) return 100;
@@ -60,19 +61,40 @@ export function validateMeasurement(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Measurement must be an object');
   const { id, operator, latitude, longitude, accuracy, timestamp, latencyMs, downloadMbps, uploadMbps, jitterMs, signalDbm, signalStatus, metricAvailability } = input;
   // `packetLossPercent` / availability.packetLoss are accepted only for old clients and rows.
-  const probeFailurePercent = input.probeFailurePercent ?? input.packetLossPercent;
+  const rawAvailability = input.metricAvailability && typeof input.metricAvailability === 'object' && !Array.isArray(input.metricAvailability) ? input.metricAvailability : null;
+  const probeAvailabilityFlag = rawAvailability?.probeFailure ?? rawAvailability?.packetLoss;
+  if (probeAvailabilityFlag !== undefined && typeof probeAvailabilityFlag !== 'boolean') throw new Error('Invalid availability metadata: probeFailure');
+  const probeFailureAvailable = probeAvailabilityFlag ?? true;
+  if (input.probeFailurePercent !== undefined && input.probeFailurePercent !== null &&
+      input.packetLossPercent !== undefined && input.packetLossPercent !== null &&
+      input.probeFailurePercent !== input.packetLossPercent) {
+    throw new Error('probeFailurePercent and its packetLossPercent compatibility alias must match');
+  }
+  const suppliedProbeFailurePercent = input.probeFailurePercent ?? input.packetLossPercent;
+  let probeFailurePercent;
   if (!OPERATORS.has(operator)) throw new Error('Invalid operator');
   const number = (name, value, min, max) => {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`Invalid ${name}`);
   };
-  number('latitude', latitude, -90, 90); number('longitude', longitude, -180, 180); number('accuracy', accuracy, 0, 10);
+  // Browser-reported GPS accuracy is valid metadata even above the preferred 10 m target.
+  // Keep its bound aligned with the existing PostgreSQL CHECK constraint.
+  number('latitude', latitude, -90, 90); number('longitude', longitude, -180, 180); number('accuracy', accuracy, 0, 10000);
   number('latencyMs', latencyMs, 0, 600000); number('downloadMbps', downloadMbps, 0, 100000); number('uploadMbps', uploadMbps, 0, 100000);
-  number('jitterMs', jitterMs, 0, 600000); number('probeFailurePercent', probeFailurePercent, 0, 100);
+  number('jitterMs', jitterMs, 0, 600000);
+  if (probeFailureAvailable) {
+    number('probeFailurePercent', suppliedProbeFailurePercent, 0, 100);
+    probeFailurePercent = suppliedProbeFailurePercent;
+  } else {
+    if ((input.probeFailurePercent !== undefined && input.probeFailurePercent !== null) ||
+        (input.packetLossPercent !== undefined && input.packetLossPercent !== null)) {
+      throw new Error('probeFailurePercent must be null when HTTP probe failure rate is unavailable');
+    }
+    probeFailurePercent = null;
+  }
   if (typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp)) || Date.parse(timestamp) > Date.now() + 300_000) throw new Error('Invalid or future timestamp');
   if (id !== undefined && (typeof id !== 'string' || id.length > 100)) throw new Error('Invalid id');
   if (signalDbm !== undefined && signalDbm !== null) number('signalDbm', signalDbm, -200, 0);
   if (!['AVAILABLE', 'UNAVAILABLE'].includes(signalStatus)) throw new Error('Invalid signalStatus');
-  const rawAvailability = metricAvailability && typeof metricAvailability === 'object' && !Array.isArray(metricAvailability) ? metricAvailability : null;
   const readAvailability = (key, legacyKey, fallback) => {
     const value = rawAvailability?.[key] ?? (legacyKey ? rawAvailability?.[legacyKey] : undefined);
     if (value === undefined) return fallback;
@@ -88,12 +110,13 @@ export function validateMeasurement(input) {
     upload: readAvailability('upload', null, true), jitter: readAvailability('jitter', null, true),
     probeFailure: readAvailability('probeFailure', 'packetLoss', true), signal: readAvailability('signal', null, signalStatus === 'AVAILABLE')
   };
+  if (availability.signal) throw new Error('Signal quality scoring is unavailable in the browser measurement pipeline');
   const measurementMethodVersion = input.measurementMethodVersion === 'quality-v2' ? 'quality-v2' : 'legacy-v1';
   const scores = { latency: availability.latency === false ? null : metricScore(latencyMs, 15, 300), throughput: availability.download === false ? null : throughputScore(downloadMbps), probeFailure: availability.probeFailure === false ? null : probeFailureScore(probeFailurePercent), jitter: availability.jitter === false ? null : jitterScore(jitterMs) };
   const weights = { latency: 0.25, throughput: 0.30, probeFailure: 0.20, jitter: 0.10 };
   const included = Object.entries(scores).filter(([, score]) => score !== null);
   const weightSum = included.reduce((sum, [name]) => sum + weights[name], 0);
-  if (weightSum === 0) throw new Error('Cannot save a measurement without a valid NQS component');
+  if (weightSum < MIN_NQS_AVAILABLE_WEIGHT) throw new Error('Cannot save a measurement without enough valid metrics for a reliable NQS');
   const nqs = Math.max(0, Math.min(100, Math.round(included.reduce((sum, [name, score]) => sum + weights[name] * score, 0) / weightSum)));
   return { id: id || randomUUID(), operator, latitude, longitude, accuracy, timestamp: new Date(timestamp).toISOString(), latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs, signalDbm: signalDbm ?? null, signalStatus, metricAvailability: availability, measurementMethodVersion };
 }

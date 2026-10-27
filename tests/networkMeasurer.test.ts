@@ -65,7 +65,8 @@ describe('Network Measurer Service with Real Server Tests', () => {
     assert.equal(sample.measurementMethodVersion, 'quality-v2');
     assert.equal(sample.throughputTestPerformed, true);
     assert.ok(sample.nqs >= 0 && sample.nqs <= 100, `NQS should be in range 0-100, got ${sample.nqs}`);
-    assert.ok(['EXCELLENT', 'GOOD', 'MODERATE', 'POOR'].includes(sample.status));
+    assert.ok(['EXCELLENT', 'GOOD', 'MODERATE', 'POOR', 'UNAVAILABLE'].includes(sample.status));
+    if (sample.status === 'UNAVAILABLE') assert.equal(sample.nqsComponents?.raw, null, 'early-session partial metrics do not produce a displayable NQS');
     assert.ok(sample.downloadMbps > 0, 'Download throughput should be positive');
     assert.ok(sample.uploadMbps > 0, 'Upload throughput should be positive');
       assert.equal(sample.metricAvailability?.jitter, false, 'First sample has no previous probe from which to calculate jitter');
@@ -155,12 +156,17 @@ describe('Network Measurer Service with Real Server Tests', () => {
     }
   });
 
-  test('invalid metric values are excluded and no available component is an unavailable score', () => {
+  test('insufficient valid metric weight is unavailable instead of producing a perfect one-metric score', () => {
     const result = measurer.calculateNqs({ latencyMs: Number.NaN, downloadMbps: -1, probeFailurePercent: 2, jitterMs: 1,
       availability: { latency: true, download: true, probeFailure: false, jitter: true } });
     assert.deepEqual(result.scores, { latency: null, throughput: null, probeFailure: null, jitter: 100 });
-    assert.equal(result.available, true);
-    assert.equal(result.nqs, 100);
+    assert.equal(result.available, false);
+    assert.equal(result.raw, null);
+    assert.equal(result.nqs, 0, '0 remains an internal sentinel when evidence is insufficient');
+    const sufficient = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 0,
+      availability: { latency: true, download: true, probeFailure: true, jitter: false } });
+    assert.equal(sufficient.available, true, '0.75 available weight meets the documented minimum');
+    assert.equal(sufficient.nqs, 100);
     const empty = measurer.calculateNqs({ latencyMs: 0, downloadMbps: 0, probeFailurePercent: 0, jitterMs: 0,
       availability: { latency: false, download: false, probeFailure: false, jitter: false } });
     assert.equal(empty.available, false);

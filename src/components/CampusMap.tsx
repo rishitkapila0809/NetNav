@@ -6,10 +6,12 @@ import { AlertTriangle, Loader2, Crosshair, Compass } from 'lucide-react';
 import type { LiveMeasurement, MeasurementSessionSummary } from '../types';
 import { networkMeasurer } from '../services/networkMeasurer';
 import { getLivePathSegments, groupExactLocations, historicalDetailHtml, historicalMarkerSpec } from '../services/historicalMeasurements';
-import type { BestSpotCandidate } from '../services/bestSpot';
+import { bestSpotCameraPoints, type BestSpotCandidate } from '../services/bestSpot';
 import type { RouteNetworkOverlay } from '../services/routeNetworkOverlay';
 import type { RouteCoordinate, WalkingRouteOption } from '../services/walkingRoutes';
 import type { RoutePickMode } from './RoutePlannerPanel';
+import { BrowserLocationTracker, type LocationFix, type LocationTrackerStatus } from '../services/locationTracker';
+import { gpsAccuracyCircleRadiusMeters, PREFERRED_GPS_ACCURACY_METERS } from '../services/measurementValidation';
 
 export interface CampusMapProps {
   center?: { lat: number; lng: number };
@@ -19,8 +21,10 @@ export interface CampusMapProps {
   bestSpotCandidate?: BestSpotCandidate | null;
   sessionSummary?: MeasurementSessionSummary | null;
   isMeasuring?: boolean;
+  locationFresh?: boolean;
+  locationHasFix?: boolean;
   onUserLocationChange?: (coords: { lat: number; lng: number; accuracy: number; speed: number | null; heading: number | null; timestamp?: number }) => void;
-  onLocationStatusChange?: (status: 'idle' | 'locating' | 'active' | 'denied' | 'error', message: string | null) => void;
+  onLocationStatusChange?: (status: LocationTrackerStatus, message: string | null) => void;
   onLocationRetryReady?: (retry: () => void) => void;
   navigationActive?: boolean;
   routeOrigin?: RouteCoordinate | null;
@@ -127,6 +131,8 @@ export const CampusMap: React.FC<CampusMapProps> = ({
   bestSpotCandidate = null,
   sessionSummary = null,
   isMeasuring: _isMeasuring = false,
+  locationFresh = true,
+  locationHasFix = false,
   onUserLocationChange,
   onLocationStatusChange,
   onLocationRetryReady,
@@ -152,7 +158,7 @@ export const CampusMap: React.FC<CampusMapProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   // Live Geolocation & Orientation State
-  const [geoStatus, setGeoStatus] = useState<'idle' | 'locating' | 'active' | 'denied' | 'error'>('idle');
+  const [geoStatus, setGeoStatus] = useState<LocationTrackerStatus>('idle');
   const [geoErrorMessage, setGeoErrorMessage] = useState<string | null>(null);
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number; accuracy: number; heading: number | null } | null>(null);
 
@@ -175,8 +181,8 @@ export const CampusMap: React.FC<CampusMapProps> = ({
   });
 
   // Geolocation & Marker Refs
-  const watchIdRef = useRef<number | null>(null);
-  const startWatchRef = useRef<(() => void) | null>(null);
+  const locationTrackerRef = useRef<BrowserLocationTracker | null>(null);
+  const latestLocationFixRef = useRef<LocationFix | null>(null);
   const userMarkerRef = useRef<google.maps.Marker | null>(null);
   const userCircleRef = useRef<google.maps.Circle | null>(null);
   const infoWindowRef = useRef<google.maps.InfoWindow | null>(null);
@@ -198,6 +204,7 @@ export const CampusMap: React.FC<CampusMapProps> = ({
 
   // Best & Worst Spot Markers Refs
   const bestSpotMarkerRef = useRef<google.maps.Marker | null>(null);
+  const lastAutoFitCandidateRef = useRef<BestSpotCandidate | null>(null);
   const worstSpotMarkerRef = useRef<google.maps.Marker | null>(null);
 
   // Compute effective heading (Priority: 1. GPS heading -> 2. Device Orientation -> 3. Last Known)
@@ -211,6 +218,85 @@ export const CampusMap: React.FC<CampusMapProps> = ({
       return deviceHeadingRef.current;
     }
     return lastKnownHeadingRef.current;
+  }, []);
+
+  const renderLocationFix = useCallback((fix: LocationFix, notifyApp = true) => {
+    const { latitude, longitude, accuracy, heading, speed, timestamp } = fix;
+    const accuracyRadius = gpsAccuracyCircleRadiusMeters(accuracy);
+    if (accuracyRadius === null) return;
+    latestLocationFixRef.current = fix;
+    if (heading !== null && Number.isFinite(heading)) gpsHeadingRef.current = heading;
+    const effectiveHeading = getEffectiveHeading();
+    const point = { lat: latitude, lng: longitude };
+    setUserCoords({ ...point, accuracy, heading: effectiveHeading });
+    if (notifyApp) onUserLocationChangeRef.current?.({ lat: latitude, lng: longitude, accuracy, speed, heading: effectiveHeading, timestamp });
+
+    const map = googleMapRef.current;
+    if (!map) return;
+    if (!userMarkerRef.current) {
+      const marker = new google.maps.Marker({ map, position: point, title: 'Your current browser location', icon: createNavigationIcon(effectiveHeading), zIndex: 2000 });
+      const info = new google.maps.InfoWindow({ content: '' });
+      marker.addListener('click', () => info.open(map, marker));
+      userMarkerRef.current = marker;
+      infoWindowRef.current = info;
+    } else {
+      userMarkerRef.current.setMap(map);
+      userMarkerRef.current.setPosition(point);
+      userMarkerRef.current.setIcon(createNavigationIcon(effectiveHeading));
+    }
+    infoWindowRef.current?.setContent(`<div style="color:#050B16;font:12px system-ui;padding:4px"><strong>YOU ARE HERE</strong><div style="font:10px monospace;margin-top:3px">Lat: ${latitude.toFixed(6)}<br>Lng: ${longitude.toFixed(6)}<br>Browser accuracy estimate: ±${Math.round(accuracy)} m</div></div>`);
+    if (!userCircleRef.current) {
+      userCircleRef.current = new google.maps.Circle({ map, center: point, radius: accuracyRadius, fillColor: '#00D9FF', fillOpacity: 0.12, strokeColor: '#35F4FF', strokeOpacity: 0.4, strokeWeight: 1.5, clickable: false, zIndex: 100 });
+    } else {
+      userCircleRef.current.setMap(map);
+      userCircleRef.current.setCenter(point);
+      userCircleRef.current.setRadius(accuracyRadius);
+    }
+    if (!hasInitialCenteredRef.current) {
+      map.panTo(point);
+      map.setZoom(17);
+      hasInitialCenteredRef.current = true;
+    }
+  }, [getEffectiveHeading]);
+
+  const renderLocationFixRef = useRef(renderLocationFix);
+  renderLocationFixRef.current = renderLocationFix;
+
+  useEffect(() => {
+    const map = googleMapRef.current;
+    userMarkerRef.current?.setMap(locationFresh ? map : null);
+    userCircleRef.current?.setMap(locationFresh ? map : null);
+  }, [locationFresh, loading]);
+
+  // Start one immediate location request when the map component mounts. Browser/OS controls
+  // permission and device location; the site cannot enable either setting itself.
+  useEffect(() => {
+    if (!window.isSecureContext) {
+      setGeoStatus('error');
+      setGeoErrorMessage('Location requires HTTPS or localhost. This HTTP LAN address is not a secure context in most browsers.');
+      onLocationStatusChangeRef.current?.('error', 'Location requires HTTPS or localhost.');
+      return;
+    }
+    if (!navigator.geolocation) {
+      setGeoStatus('unsupported');
+      setGeoErrorMessage('This browser does not support geolocation.');
+      onLocationStatusChangeRef.current?.('unsupported', 'This browser does not support geolocation.');
+      return;
+    }
+    const tracker = new BrowserLocationTracker(navigator.geolocation,
+      (status, message) => {
+        setGeoStatus(status);
+        setGeoErrorMessage(message);
+        onLocationStatusChangeRef.current?.(status, message);
+      },
+      (fix) => renderLocationFixRef.current(fix)
+    );
+    locationTrackerRef.current = tracker;
+    tracker.start();
+    return () => {
+      tracker.stop();
+      if (locationTrackerRef.current === tracker) locationTrackerRef.current = null;
+    };
   }, []);
 
   // Request Mobile Device Orientation Permission (iOS Safari)
@@ -261,7 +347,7 @@ export const CampusMap: React.FC<CampusMapProps> = ({
 
   const retryLocation = async () => {
     if (!window.isSecureContext) {
-      setGeoStatus('error');
+      setGeoStatus('unsupported');
       setGeoErrorMessage('Location requires a secure connection. Open this site using HTTPS or localhost.');
       return;
     }
@@ -280,15 +366,14 @@ export const CampusMap: React.FC<CampusMapProps> = ({
           return;
         }
       }
-      setGeoStatus('locating');
+      setGeoStatus('requesting');
       setGeoErrorMessage(null);
-      if (watchIdRef.current === null) startWatchRef.current?.();
-      else setGeoErrorMessage('Waiting for a fresh GPS fix from the active location watcher…');
+      locationTrackerRef.current?.retry();
     } catch {
       // Permissions API is optional; the Geolocation API remains the fallback.
-      setGeoStatus('locating');
+      setGeoStatus('requesting');
       setGeoErrorMessage(null);
-      if (watchIdRef.current === null) startWatchRef.current?.();
+      locationTrackerRef.current?.retry();
     }
   };
 
@@ -338,179 +423,7 @@ export const CampusMap: React.FC<CampusMapProps> = ({
         setLoading(false);
         onMapsReadyRef.current?.(true);
 
-        // Start the one persistent GPS watcher as soon as the map is ready.
-        // A LAN HTTP origin is not a secure context on most mobile browsers.
-        if (!window.isSecureContext) {
-          setGeoStatus('error');
-          setGeoErrorMessage('Location requires HTTPS or localhost. This HTTP LAN address is not a secure context on most mobile browsers.');
-          return;
-        }
-        if (!navigator.geolocation) {
-          setGeoStatus('error');
-          setGeoErrorMessage('Geolocation is not supported by this browser.');
-          return;
-        }
-
-        const startWatching = () => {
-          if (watchIdRef.current !== null) return;
-          setGeoStatus('locating');
-          setGeoErrorMessage(null);
-          watchIdRef.current = navigator.geolocation.watchPosition(
-          (position) => {
-            const { latitude, longitude, accuracy, heading, speed } = position.coords;
-
-            // GPS Outlier Filter: Ignore invalid coordinates with extreme inaccuracy (> 150m)
-            if (accuracy > 150) {
-              console.warn('[NETNAV GPS FILTERED OUTLIER]', accuracy, latitude, longitude);
-              setGeoStatus('error');
-              setGeoErrorMessage(`GPS accuracy is currently ±${Math.round(accuracy)} m. Waiting for a more accurate fix.`);
-              return;
-            }
-
-            console.log('[NETNAV GPS]', latitude, longitude, accuracy, 'Heading:', heading, 'Speed:', speed);
-
-            if (heading !== null && !isNaN(heading)) {
-              gpsHeadingRef.current = heading;
-            }
-
-            const effectiveHeading = getEffectiveHeading();
-            const newPos = { lat: latitude, lng: longitude };
-
-            setUserCoords({ lat: latitude, lng: longitude, accuracy, heading: effectiveHeading });
-            setGeoStatus('active');
-
-            if (onUserLocationChangeRef.current) {
-              onUserLocationChangeRef.current({
-                lat: latitude,
-                lng: longitude,
-                accuracy,
-                speed: speed ?? null,
-                heading: effectiveHeading,
-                timestamp: Number.isFinite(position.timestamp) && position.timestamp > 0 ? position.timestamp : Date.now()
-              });
-            }
-
-            const map = googleMapRef.current;
-            if (!map) return;
-
-            // Create or Update Directional Navigation Marker
-            if (!userMarkerRef.current) {
-              const marker = new google.maps.Marker({
-                position: newPos,
-                map,
-                title: 'You are here',
-                icon: createNavigationIcon(effectiveHeading),
-                zIndex: 2000 // Always top layer
-              });
-
-              const infoWindow = new google.maps.InfoWindow({
-                content: `
-                  <div style="color: #050B16; font-family: system-ui, sans-serif; padding: 4px; font-weight: 700; font-size: 12px;">
-                    📍 YOU ARE HERE
-                    <div style="font-size: 10px; font-weight: 500; color: #555; margin-top: 3px; font-family: monospace;">
-                      Lat: ${latitude.toFixed(5)}<br/>
-                      Lng: ${longitude.toFixed(5)}<br/>
-                      GPS Accuracy: ±${Math.round(accuracy)}m
-                    </div>
-                  </div>
-                `
-              });
-              infoWindowRef.current = infoWindow;
-
-              marker.addListener('click', () => {
-                infoWindow.open(map, marker);
-              });
-
-              userMarkerRef.current = marker;
-            } else {
-              userMarkerRef.current.setPosition(newPos);
-              userMarkerRef.current.setIcon(createNavigationIcon(effectiveHeading));
-              if (infoWindowRef.current) {
-                infoWindowRef.current.setContent(`
-                  <div style="color: #050B16; font-family: system-ui, sans-serif; padding: 4px; font-weight: 700; font-size: 12px;">
-                    📍 YOU ARE HERE
-                    <div style="font-size: 10px; font-weight: 500; color: #555; margin-top: 3px; font-family: monospace;">
-                      Lat: ${latitude.toFixed(5)}<br/>
-                      Lng: ${longitude.toFixed(5)}<br/>
-                      GPS Accuracy: ±${Math.round(accuracy)}m
-                    </div>
-                  </div>
-                `);
-              }
-            }
-
-            // Accuracy Circle
-            if (!userCircleRef.current) {
-              userCircleRef.current = new google.maps.Circle({
-                map,
-                center: newPos,
-                radius: accuracy,
-                fillColor: '#00D9FF',
-                fillOpacity: 0.12,
-                strokeColor: '#35F4FF',
-                strokeOpacity: 0.4,
-                strokeWeight: 1.5,
-                clickable: false,
-                zIndex: 100
-              });
-            } else {
-              userCircleRef.current.setCenter(newPos);
-              userCircleRef.current.setRadius(accuracy);
-            }
-
-            // Center map once upon first GPS fix
-            if (!hasInitialCenteredRef.current) {
-              map.panTo(newPos);
-              map.setZoom(17);
-              hasInitialCenteredRef.current = true;
-            }
-          },
-          (err) => {
-            console.warn('Geolocation error:', err);
-            if (err.code === err.PERMISSION_DENIED) {
-              if (watchIdRef.current !== null) {
-                navigator.geolocation.clearWatch(watchIdRef.current);
-                watchIdRef.current = null;
-              }
-              setGeoStatus('denied');
-              setGeoErrorMessage('Location is blocked. Enable location for this site in your browser or device settings. The browser may not show another prompt until you change this setting.');
-            } else if (err.code === err.POSITION_UNAVAILABLE) {
-              setGeoStatus('error');
-              setGeoErrorMessage('Your location is unavailable. Check device location services and try again.');
-            } else if (err.code === err.TIMEOUT) {
-              setGeoStatus('error');
-              setGeoErrorMessage('Location request timed out. Retry when you have a clearer GPS signal.');
-            } else {
-              setGeoStatus('error');
-              setGeoErrorMessage(err.message || 'The browser could not retrieve your location.');
-            }
-          },
-          {
-            enableHighAccuracy: true,
-            timeout: 3000,
-            maximumAge: 0
-          }
-          );
-        };
-        startWatchRef.current = startWatching;
-
-        const requestLocation = async () => {
-          if (navigator.permissions?.query) {
-            try {
-              const permission = await navigator.permissions.query({ name: 'geolocation' });
-              if (permission.state === 'denied') {
-                setGeoStatus('denied');
-                setGeoErrorMessage('Location is blocked. Enable location for this site in your browser or device settings.');
-                return;
-              }
-              // Both granted and prompt states use the same single watcher.
-            } catch {
-              // Safari and some embedded browsers do not implement this query.
-            }
-          }
-          startWatching();
-        };
-        void requestLocation();
+        if (latestLocationFixRef.current) renderLocationFixRef.current(latestLocationFixRef.current, false);
       })
       .catch((err: unknown) => {
         console.error('Error loading Google Maps API:', err);
@@ -599,12 +512,13 @@ export const CampusMap: React.FC<CampusMapProps> = ({
     for (const group of groups) {
       const row = group[0];
       const spec = historicalMarkerSpec(group);
+      if (import.meta.env.DEV) console.debug(`[NETNAV MAP] ${row.operator} historical marker: ${spec.scoreField}=${spec.label}, eligible=${spec.scoredCount}/${group.length}`);
       const marker = new google.maps.Marker({
         map,
         position: spec.position,
-        title: `${row.operator} · NQS ${spec.nqs ?? 'N/A'} · ${group.length} saved sample${group.length === 1 ? '' : 's'}`,
-        icon: { path: google.maps.SymbolPath.CIRCLE, fillColor: spec.color, fillOpacity: 0.95, strokeColor: '#FFFFFF', strokeWeight: 1.5, scale: group.length > 1 ? 9 : 7 },
-        label: { text: spec.nqs === null ? 'N/A' : String(spec.nqs), color: spec.nqs === null ? '#FFFFFF' : '#07111D', fontWeight: '700', fontSize: '9px' },
+        title: `${row.operator} · stored NQS ${spec.label} · ${spec.scoredCount}/${group.length} eligible saved sample(s) · source field: ${spec.scoreField}`,
+        icon: { path: google.maps.SymbolPath.CIRCLE, fillColor: spec.color, fillOpacity: 0.98, strokeColor: '#FFFFFF', strokeWeight: 1.5, scale: group.length > 1 ? 12 : 10 },
+        label: { text: spec.label, color: spec.nqs === null || spec.nqs < 40 ? '#FFFFFF' : '#07111D', fontWeight: '800', fontSize: spec.label === 'N/A' ? '11px' : '12px' },
         zIndex: 500 + (spec.nqs ?? 0)
       });
       const info = new google.maps.InfoWindow({ content: historicalDetailHtml(group) });
@@ -617,7 +531,10 @@ export const CampusMap: React.FC<CampusMapProps> = ({
     const map = googleMapRef.current;
     findBestMarkerRef.current?.setMap(null);
     findBestMarkerRef.current = null;
-    if (!map || loading || !bestSpotCandidate) return;
+    if (!map || loading || !bestSpotCandidate) {
+      if (!bestSpotCandidate) lastAutoFitCandidateRef.current = null;
+      return;
+    }
     findBestMarkerRef.current = new google.maps.Marker({
       map,
       position: { lat: bestSpotCandidate.latitude, lng: bestSpotCandidate.longitude },
@@ -626,6 +543,25 @@ export const CampusMap: React.FC<CampusMapProps> = ({
       label: { text: 'BEST', color: '#FFFFFF', fontWeight: '900', fontSize: '10px' },
       zIndex: 2000
     });
+    const accuracyWarning = bestSpotCandidate.searchGpsAccuracy > PREFERRED_GPS_ACCURACY_METERS
+      ? `<div style="color:#8a5b00">Current GPS uncertainty ±${Math.round(bestSpotCandidate.searchGpsAccuracy)} m exceeds the nominal 10 m radius; actual proximity may differ.</div>` : '';
+    const info = new google.maps.InfoWindow({ content: `<div style="font:12px system-ui;color:#101820"><strong>Best measured spot near your GPS estimate</strong><div>${bestSpotCandidate.operator} · NQS ${bestSpotCandidate.nqs}/100 · ${bestSpotCandidate.sampleCount} sample(s)</div><div>${bestSpotCandidate.distanceMeters.toFixed(1)} m from GPS estimate (reported uncertainty ±${Math.round(bestSpotCandidate.searchGpsAccuracy)} m)</div>${accuracyWarning}<div>Last measured: ${new Date(bestSpotCandidate.lastMeasured).toLocaleString()}</div><div>Saved coordinate: ${bestSpotCandidate.latitude.toFixed(6)}, ${bestSpotCandidate.longitude.toFixed(6)}</div><div>Mean recorded GPS accuracy: ±${bestSpotCandidate.averageAccuracy.toFixed(1)} m</div></div>` });
+    findBestMarkerRef.current.addListener('click', () => info.open({ map, anchor: findBestMarkerRef.current! }));
+    if (lastAutoFitCandidateRef.current !== bestSpotCandidate) {
+      const points = bestSpotCameraPoints(bestSpotCandidate, userCoords ? { lat: userCoords.lat, lng: userCoords.lng } : null);
+      if (points.length === 2 && (points[0].lat !== points[1].lat || points[0].lng !== points[1].lng)) {
+        const bounds = new google.maps.LatLngBounds();
+        points.forEach((point) => bounds.extend(point));
+        map.fitBounds(bounds, 72);
+        google.maps.event.addListenerOnce(map, 'idle', () => {
+          if (map.getZoom() !== undefined && map.getZoom()! > 18) map.setZoom(18);
+        });
+      } else {
+        map.setCenter(points.at(-1)!);
+        map.setZoom(17);
+      }
+      lastAutoFitCandidateRef.current = bestSpotCandidate;
+    }
   }, [bestSpotCandidate, loading]);
 
   // Only draw ordered, geographically continuous current-session samples. History is never passed here.
@@ -748,13 +684,9 @@ export const CampusMap: React.FC<CampusMapProps> = ({
     }
   }, [sessionSummary, loading]);
 
-  // Clean up Geolocation Watch & Map Overlays ONLY on Component Unmount
+  // Clean up map overlays on unmount. The tracker owns and clears its single GPS watcher.
   useEffect(() => {
     return () => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
       if (userMarkerRef.current) {
         userMarkerRef.current.setMap(null);
         userMarkerRef.current = null;
@@ -813,11 +745,11 @@ export const CampusMap: React.FC<CampusMapProps> = ({
       {/* Live Geolocation Status & GPS Accuracy Indicator Overlay */}
       {!loading && !error && (
         <div style={styles.geoStatusPill} className="map-gps-pill">
-          {geoStatus === 'active' && (
+          {!locationFresh && locationHasFix ? <span style={{ color: '#FFD36A' }}>GPS FIX STALE · WAITING FOR UPDATE</span> : locationFresh && (geoStatus === 'ready' || geoStatus === 'low-confidence') && (
             <>
               <span style={{ ...styles.pulseDot, backgroundColor: '#00E676', boxShadow: '0 0 8px #00E676' }} />
-              <span style={{ color: '#F5FAFF' }}>
-                LIVE GPS ACTIVE
+              <span style={{ color: geoStatus === 'ready' ? '#F5FAFF' : '#FFD36A' }}>
+                {geoStatus === 'ready' ? 'LIVE GPS READY' : 'GPS LOW CONFIDENCE · IMPROVING'}
                 {userCoords && (
                   <span style={styles.coordsText}>
                     GPS ±{Math.round(userCoords.accuracy)}m ({userCoords.lat.toFixed(4)}°, {userCoords.lng.toFixed(4)}°)
@@ -827,18 +759,18 @@ export const CampusMap: React.FC<CampusMapProps> = ({
             </>
           )}
 
-          {geoStatus === 'locating' && (
+          {!locationHasFix && (geoStatus === 'requesting' || geoStatus === 'locating' || geoStatus === 'idle') && (
             <>
               <Loader2 size={12} color="#00D9FF" style={{ animation: 'radarScan 1.5s linear infinite' }} />
               <span style={{ color: '#00D9FF' }}>LOCATING MOBILE GPS...</span>
             </>
           )}
 
-          {(geoStatus === 'denied' || geoStatus === 'error') && (
+          {!locationFresh && !locationHasFix && ['denied', 'unavailable', 'timeout', 'unsupported', 'error'].includes(geoStatus) && (
             <>
               <span style={{ ...styles.pulseDot, backgroundColor: '#FF1744' }} />
               <span style={{ color: '#FF1744' }}>{geoErrorMessage || 'GPS UNAVAILABLE'}</span>
-              {geoStatus === 'error' && window.isSecureContext && (
+              {window.isSecureContext && (
                 <button type="button" style={styles.retryBtn} onClick={retryLocation}>RETRY LOCATION</button>
               )}
             </>

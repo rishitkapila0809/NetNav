@@ -49,7 +49,7 @@ export const MetricsCard: React.FC<MetricsCardProps> = ({ measurement, source, h
           <span>{component.label}</span>
           <span>{component.score === null || component.raw === undefined ? 'N/A · excluded' : `${component.raw} ${component.unit} → ${component.score}/100 · weight ${(component.weight * 100).toFixed(0)}% · +${(component.contribution ?? 0).toFixed(2)}`}</span>
         </div>)}
-        <div style={styles.breakdownHeader}>Available score weight: {evaluation?.availableWeight.toFixed(2) ?? '0.00'} / 0.85 measurable (signal weight 0.15 unavailable in browsers).</div>
+        <div style={styles.breakdownHeader}>Available score weight: {evaluation?.availableWeight.toFixed(2) ?? '0.00'} / 0.85 measurable (signal weight 0.15 unavailable in browsers). NQS requires at least 0.70 valid weight; below that it is N/A.</div>
       </div>
       <div style={styles.metricsGrid}>{tiles.map((tile) => <div key={tile.key} style={styles.metricTile}>
         <div style={styles.tileHeader}>{tile.icon}<span style={styles.tileLabel}>{tile.label}</span></div>

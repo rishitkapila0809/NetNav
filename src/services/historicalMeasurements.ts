@@ -1,5 +1,6 @@
 import type { LiveMeasurement, TelecomOperator } from '../types';
 import { networkMeasurer } from './networkMeasurer.ts';
+import { calculateMeasurementNqs } from './measurementTelemetry.ts';
 
 export type HistoryStatus = 'loading' | 'loaded' | 'error';
 export type OperatorFilter = 'All' | TelecomOperator;
@@ -18,7 +19,9 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
   const latitude = numeric(row.latitude, -90, 90);
   const longitude = numeric(row.longitude, -180, 180);
   const accuracy = numeric(row.accuracy, 0, 10000);
-  const nqs = numeric(row.nqs, 0, 100);
+  // The Express history API aliases the database SMALLINT to `nqs`; accept `NQS`
+  // as a compatibility spelling for older exports without deriving a score.
+  const nqs = numeric(row.nqs ?? row.NQS, 0, 100);
   const timestamp = new Date(String(row.timestamp));
   if (latitude === undefined || longitude === undefined || accuracy === undefined || nqs === undefined || !Number.isFinite(timestamp.getTime()) || timestamp.getTime() > Date.now() + 300_000) return null;
 
@@ -28,9 +31,10 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
   for (const key of availabilityKeys) metricAvailability[key] = key === 'probeFailure'
     ? rawAvailability.probeFailure === true || (rawAvailability._methodVersion !== 'quality-v2' && rawAvailability.packetLoss === true)
     : rawAvailability[key] === true;
-  const measurementMethodVersion = rawAvailability._methodVersion === 'quality-v2' ? 'quality-v2'
-    : rawAvailability._methodVersion === 'legacy-v1' ? 'legacy-v1'
-      : Object.hasOwn(rawAvailability, 'probeFailure') ? 'quality-v2' : 'legacy-v1';
+  // Trust requires the explicit version written by the current persistence path.
+  // A `probeFailure` property alone is not sufficient: older serializers used
+  // compatibility aliases and may contain scores calculated under another method.
+  const measurementMethodVersion = rawAvailability._methodVersion === 'quality-v2' ? 'quality-v2' : 'legacy-v1';
   const storedDownloadAt = typeof row.downloadMeasuredAt === 'string' && Number.isFinite(Date.parse(row.downloadMeasuredAt)) ? row.downloadMeasuredAt : undefined;
   const storedUploadAt = typeof row.uploadMeasuredAt === 'string' && Number.isFinite(Date.parse(row.uploadMeasuredAt)) ? row.uploadMeasuredAt : undefined;
   const metric = (key: typeof availabilityKeys[number], value: unknown, min: number, max: number): number => {
@@ -49,7 +53,7 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
         key === 'probeFailure' ? 100 : key === 'signal' ? 0 : key === 'download' || key === 'upload' ? 100000 : 600000) === undefined)) return null;
 
   const hasScorableMetric = ['latency', 'download', 'probeFailure', 'jitter'].some((key) => metricAvailability[key] === true);
-  return {
+  const mapped: LiveMeasurement = {
     id: String(row.id ?? `${latitude},${longitude},${timestamp.toISOString()}`), latitude, longitude, accuracy,
     timestamp: timestamp.toISOString(), operator: row.operator as TelecomOperator,
     latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs,
@@ -61,6 +65,8 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
     signalStatus: metricAvailability.signal && signalDbm !== undefined ? 'AVAILABLE' : 'UNAVAILABLE',
     metricAvailability
   };
+  if (measurementMethodVersion === 'quality-v2' && calculateMeasurementNqs(mapped).nqs === null) mapped.status = 'UNAVAILABLE';
+  return mapped;
 }
 
 export function mapHistoricalRecords(value: unknown): LiveMeasurement[] {
@@ -90,18 +96,44 @@ export function groupExactLocations(rows: LiveMeasurement[]): LiveMeasurement[][
 }
 
 const NQS_RECENCY_HALF_LIFE_MS = 30 * 86_400_000;
+function trustedScoredRows(group: LiveMeasurement[]): LiveMeasurement[] {
+  return group.filter((row) => row.status !== 'NO_CONNECTIVITY' && row.status !== 'UNAVAILABLE' && row.measurementMethodVersion === 'quality-v2' &&
+    Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100 && calculateMeasurementNqs(row).verification === 'match');
+}
+
 export function recencyWeightedGroupNqs(group: LiveMeasurement[], now = Date.now()): number | null {
-  const scored = group.filter((row) => row.status !== 'NO_CONNECTIVITY' && row.status !== 'UNAVAILABLE' && row.measurementMethodVersion !== 'legacy-v1' && Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100);
+  const scored = trustedScoredRows(group);
   if (!scored.length) return null;
   const weights = scored.map((row) => Math.pow(0.5, Math.max(0, now - Date.parse(row.timestamp)) / NQS_RECENCY_HALF_LIFE_MS));
   const weightSum = weights.reduce((sum, weight) => sum + weight, 0);
   return weightSum ? Math.round(scored.reduce((sum, row, index) => sum + row.nqs * weights[index], 0) / weightSum) : null;
 }
 
-export function historicalMarkerSpec(group: LiveMeasurement[], now = Date.now()): { position: { lat: number; lng: number }; color: string; count: number; nqs: number | null } {
+export function historicalMarkerSpec(group: LiveMeasurement[], now = Date.now()): { position: { lat: number; lng: number }; color: string; count: number; scoredCount: number; scoreField: 'nqs'; label: string; unavailableReason: string | null; nqs: number | null } {
   const row = group[0];
+  const scoredCount = trustedScoredRows(group).length;
   const nqs = recencyWeightedGroupNqs(group, now);
-  return { position: { lat: row.latitude, lng: row.longitude }, color: nqs === null ? '#60788C' : getNqsMarkerColor(nqs), count: group.length, nqs };
+  const allLegacy = group.length > 0 && group.every((item) => item.measurementMethodVersion === 'legacy-v1');
+  const unavailableReason = nqs !== null ? null : allLegacy
+    ? 'No trusted NQS: this group contains only legacy/unverified measurements.'
+    : 'No trusted NQS: no eligible quality-v2 record has a valid available score.';
+  return { position: { lat: row.latitude, lng: row.longitude }, color: nqs === null ? '#60788C' : getNqsMarkerColor(nqs), count: group.length,
+    scoredCount, scoreField: 'nqs', label: nqs === null ? 'N/A' : String(nqs), unavailableReason, nqs };
+}
+
+export interface HistoricalScoreDiagnostics { loaded: number; validNqs: number; trustedNqs: number; legacyOrUnverified: number; ineligible: number }
+export function summarizeHistoricalScores(rows: unknown[]): HistoricalScoreDiagnostics {
+  let validNqs = 0, trustedNqs = 0, legacyOrUnverified = 0;
+  for (const value of rows) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) { legacyOrUnverified++; continue; }
+    const row = value as Record<string, unknown>;
+    if (numeric(row.nqs ?? row.NQS, 0, 100) !== undefined) validNqs++;
+    const mapped = mapHistoricalRecord(row);
+    if (mapped?.measurementMethodVersion === 'legacy-v1') legacyOrUnverified++;
+    if (mapped && mapped.measurementMethodVersion === 'quality-v2' && mapped.status !== 'UNAVAILABLE' && mapped.status !== 'NO_CONNECTIVITY' &&
+        Number.isFinite(mapped.nqs) && mapped.nqs >= 0 && mapped.nqs <= 100 && calculateMeasurementNqs(mapped).verification === 'match') trustedNqs++;
+  }
+  return { loaded: rows.length, validNqs, trustedNqs, legacyOrUnverified, ineligible: rows.length - trustedNqs };
 }
 
 export function formatHistoricalMetric(value: number | undefined, available: boolean, suffix: string): string {
@@ -111,8 +143,10 @@ export function formatHistoricalMetric(value: number | undefined, available: boo
 export function historicalDetailHtml(rows: LiveMeasurement[]): string {
   const esc = (value: string) => value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
   const aggregate = recencyWeightedGroupNqs(rows);
+  const spec = historicalMarkerSpec(rows);
+  const scoreNote = `<div>Marker score uses stored ${spec.scoreField} from ${spec.scoredCount} eligible sample(s).${spec.unavailableReason ? ` ${esc(spec.unavailableReason)}` : ''}</div>`;
   const summary = `<strong>${rows.length} saved sample${rows.length === 1 ? '' : 's'} Â· Recency-weighted NQS: ${aggregate === null ? 'N/A' : `${aggregate}/100`}</strong>`;
-  return `<div style="font:12px system-ui,sans-serif;color:#101820;max-width:300px;max-height:320px;overflow:auto">${summary}${rows.map((row) => {
+  return `<div style="font:12px system-ui,sans-serif;color:#101820;max-width:300px;max-height:320px;overflow:auto">${summary}${scoreNote}${rows.map((row) => {
     const available = row.metricAvailability ?? {};
     const metric = (key: string, value: number | undefined, suffix: string) => formatHistoricalMetric(value, available[key] === true, suffix);
     return `<section style="padding:6px 0;border-bottom:1px solid #ccd">` +

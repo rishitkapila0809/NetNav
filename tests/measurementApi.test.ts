@@ -1,6 +1,8 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMeasurementServer, parseAllowedOrigins, validateMeasurement, saveMeasurement, listMeasurements } from '../server/index.js';
+import { buildMeasurementRequestPayload } from '../src/services/measurementPayload.ts';
+import type { LiveMeasurement } from '../src/types.ts';
 
 const valid = {
   id: 'sample-1', operator: 'Jio', latitude: 12.9692, longitude: 79.1559, accuracy: 8,
@@ -64,6 +66,11 @@ describe('Measurement API validation and persistence contract', () => {
     assert.equal(result.metricAvailability.signal, false);
   });
 
+  test('accepts and preserves a valid lower-confidence browser GPS accuracy', () => {
+    const result = validateMeasurement({ ...valid, accuracy: 64 });
+    assert.equal(result.accuracy, 64);
+  });
+
   test('accepts legacy packetLoss payloads but stores them as HTTP probe failures with a legacy version', () => {
     const oldClient = validateMeasurement({ ...valid, measurementMethodVersion: 'legacy-v1', probeFailurePercent: undefined,
       packetLossPercent: 10, metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false } });
@@ -73,18 +80,66 @@ describe('Measurement API validation and persistence contract', () => {
     assert.equal(oldClient.measurementMethodVersion, 'legacy-v1');
   });
 
+  test('accepts the client compatibility alias while preserving HTTP probe-failure semantics', () => {
+    const compatible = validateMeasurement({ ...valid, probeFailurePercent: 12.5, packetLossPercent: 12.5,
+      metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, packetLoss: true, signal: false } });
+    assert.equal(compatible.probeFailurePercent, 12.5);
+    assert.equal(compatible.metricAvailability.probeFailure, true);
+    assert.equal(compatible.metricAvailability.packetLoss, undefined);
+  });
+
+  test('server rejects out-of-range, non-finite, and malformed legacy alias values', () => {
+    const availability = { latency: true, download: true, upload: true, jitter: true, probeFailure: true, packetLoss: true, signal: false };
+    for (const packetLossPercent of [-0.1, 100.1, Number.NaN, Number.POSITIVE_INFINITY, '12.5']) {
+      assert.throws(() => validateMeasurement({ ...valid, probeFailurePercent: undefined, packetLossPercent, metricAvailability: availability }), /Invalid probeFailurePercent/);
+    }
+  });
+
+  test('client payload emits numeric aliases only for available finite probe failure data', () => {
+    const sample = { ...valid, status: 'GOOD', metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: false } } as LiveMeasurement;
+    const zero = buildMeasurementRequestPayload({ ...sample, probeFailurePercent: 0 });
+    assert.equal(zero.probeFailurePercent, 0);
+    assert.equal(zero.packetLossPercent, 0);
+    assert.equal((zero.metricAvailability as Record<string, unknown>).packetLoss, true);
+    const nonzero = buildMeasurementRequestPayload({ ...sample, probeFailurePercent: 12.5 });
+    assert.equal(nonzero.packetLossPercent, 12.5);
+    const unavailable = buildMeasurementRequestPayload({ ...sample, probeFailurePercent: 0,
+      metricAvailability: { ...sample.metricAvailability, probeFailure: false } });
+    assert.equal(unavailable.probeFailurePercent, null);
+    assert.equal(unavailable.packetLossPercent, null);
+    assert.equal((unavailable.metricAvailability as Record<string, unknown>).packetLoss, false);
+    assert.throws(() => buildMeasurementRequestPayload({ ...sample, probeFailurePercent: Number.NaN }), /finite percentage/);
+    assert.throws(() => buildMeasurementRequestPayload({ ...sample, probeFailurePercent: Number.POSITIVE_INFINITY }), /finite percentage/);
+    assert.throws(() => buildMeasurementRequestPayload({ ...sample, probeFailurePercent: 100.1 }), /finite percentage/);
+    assert.throws(() => buildMeasurementRequestPayload({ ...sample, probeFailurePercent: -0.1 }), /finite percentage/);
+    assert.throws(() => buildMeasurementRequestPayload({ ...sample, probeFailurePercent: '0' as unknown as number }), /finite percentage/);
+  });
+
   test('rejects invalid operator, coordinates, numeric ranges, timestamps and metadata', () => {
     for (const value of [
       { ...valid, operator: 'Other' }, { ...valid, latitude: 91 }, { ...valid, longitude: Infinity },
-      { ...valid, accuracy: -1 }, { ...valid, accuracy: 10.1 }, { ...valid, latencyMs: -1 }, { ...valid, downloadMbps: NaN },
+      { ...valid, accuracy: -1 }, { ...valid, accuracy: 10000.1 }, { ...valid, latencyMs: -1 }, { ...valid, downloadMbps: NaN },
       { ...valid, probeFailurePercent: 101 }, { ...valid, timestamp: 'not a date' },
       { ...valid, timestamp: '2999-01-01T00:00:00.000Z' },
-      { ...valid, metricAvailability: { signal: 'no' } }
+      { ...valid, metricAvailability: { signal: 'no' } },
+      { ...valid, probeFailurePercent: undefined, packetLossPercent: 101, metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, packetLoss: true, signal: false } },
+      { ...valid, packetLossPercent: '10', probeFailurePercent: undefined, metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, packetLoss: true, signal: false } },
+      { ...valid, signalDbm: -96, signalStatus: 'AVAILABLE', metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: true } }
     ]) assert.throws(() => validateMeasurement(value));
   });
 
   test('refuses to persist an NQS when every score component is unavailable', () => {
-    assert.throws(() => validateMeasurement({ ...valid, metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } }), /without a valid NQS component/);
+    assert.throws(() => validateMeasurement({ ...valid, probeFailurePercent: null, packetLossPercent: null,
+      metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } }), /enough valid metrics/);
+    assert.throws(() => validateMeasurement({ ...valid, probeFailurePercent: null, packetLossPercent: null,
+      metricAvailability: { latency: false, download: false, upload: false, jitter: true, probeFailure: false, signal: false } }), /enough valid metrics/);
+  });
+
+  test('unavailable probe failure is explicit null, never a fabricated zero, and is rejected as insufficient for scoring', () => {
+    assert.throws(() => validateMeasurement({ ...valid, probeFailurePercent: null, packetLossPercent: null,
+      metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: false, packetLoss: false, signal: false } }), /enough valid metrics/);
+    assert.throws(() => validateMeasurement({ ...valid, probeFailurePercent: 0, packetLossPercent: 0,
+      metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: false, packetLoss: false, signal: false } }), /must be null when.*unavailable/);
   });
 
   test('uses parameterized SQL for insert and bounded filtered retrieval', async () => {
@@ -118,16 +173,25 @@ describe('Measurement API validation and persistence contract', () => {
     const address = server.address(); assert.ok(address && typeof address !== 'string');
     const base = `http://127.0.0.1:${address.port}`;
     try {
-      const saved = await fetch(`${base}/api/measurements`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(valid) });
+      const legacyFieldPayload = { ...valid, probeFailurePercent: undefined, packetLossPercent: 0,
+        metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false } };
+      const saved = await fetch(`${base}/api/measurements`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(legacyFieldPayload) });
       assert.equal(saved.status, 201);
       const savedBody = await saved.json() as Record<string, unknown>;
       assert.equal(savedBody.id, valid.id);
+      assert.equal(savedBody.probeFailurePercent, 0, 'legacy alias zero is preserved as an observed HTTP probe failure rate');
+      const lowerConfidenceSave = await fetch(`${base}/api/measurements`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...valid, id: 'lower-confidence', accuracy: 64 }) });
+      assert.equal(lowerConfidenceSave.status, 201);
+      const lowerConfidenceRecord = await lowerConfidenceSave.json() as Record<string, unknown>;
+      assert.equal(lowerConfidenceRecord.accuracy, 64);
       const listed = await fetch(`${base}/api/measurements?operator=Jio&limit=10`);
       assert.equal(listed.status, 200);
       const history = (await listed.json() as { measurements: Array<Record<string, unknown>> }).measurements;
-      assert.equal(history.length, 1);
+      assert.equal(history.length, 2);
       assert.equal(history[0].downloadMbps, valid.downloadMbps);
       assert.equal(history[0].operator, valid.operator);
+      assert.equal(history[0].nqs, 80, 'history returns the server-recalculated NQS for the inserted record');
+      assert.equal((history[0].metricAvailability as Record<string, unknown>)._methodVersion, 'quality-v2');
       const cursorPage = await fetch(`${base}/api/measurements?operator=Jio&limit=10&before=${encodeURIComponent(valid.timestamp)}&beforeId=${valid.id}`);
       assert.equal(cursorPage.status, 200);
       const bad = await fetch(`${base}/api/measurements`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...valid, latitude: 100 }) });

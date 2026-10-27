@@ -3,7 +3,7 @@ import type { TelecomOperator } from '../types';
 import type { BestSpotCandidate, BestSpotResult } from '../services/bestSpot';
 import { Activity, Award, Clock, MapPin, Radio, RefreshCw } from 'lucide-react';
 
-type BestSpotViewState = BestSpotResult | { status: 'idle' | 'history-loading' | 'history-error' };
+type BestSpotViewState = BestSpotResult | { status: 'idle' | 'history-loading'; message?: string } | { status: 'history-error'; message?: string } | { status: 'history-incomplete'; message?: string };
 interface BestSpotCardProps {
   selectedOperator: TelecomOperator;
   state: BestSpotViewState;
@@ -21,12 +21,12 @@ export const BestSpotCard: React.FC<BestSpotCardProps> = ({ selectedOperator, st
   const messages: Record<BestSpotViewState['status'], string> = {
     idle: 'Use Find Best Spot to search saved measurements within 10 metres of your current location.',
     'gps-unavailable': 'Waiting for a GPS fix. Enable location access and wait for the map to report your position.',
-    'gps-stale': 'Your GPS fix is older than 30 seconds. Wait for a fresh position, then retry.',
+    'gps-stale': 'Your GPS fix is older than 10 seconds. Wait for a fresh position, then retry.',
     'gps-invalid': 'The browser returned invalid coordinates or accuracy data. Retry location from the map.',
-    'gps-inaccurate': 'GPS accuracy is worse than 10 metres, so this search cannot reliably use a 10-metre radius. Wait for a more accurate fix and retry.',
     'history-loading': 'Loading saved measurements…',
     'history-error': 'Saved measurements could not be loaded. Retry history, then search again.',
-    'no-data': `No valid ${selectedOperator} measurements were found within 10 metres. Measure this area to add historical data.`,
+    'history-incomplete': 'The saved history search reached its safety limit. Cannot confirm that this area has no eligible records; retry later or reduce the history size.',
+    'no-data': `No verified measurement was found within the nominal 10-metre radius of your GPS estimate for ${selectedOperator}.`,
     success: ''
   };
 
@@ -49,7 +49,7 @@ export const BestSpotCard: React.FC<BestSpotCardProps> = ({ selectedOperator, st
               <div style={styles.scoreSubtext}><Radio size={12} color="#00D9FF" /><span>{candidate.operator} · {candidate.sampleCount} sample{candidate.sampleCount === 1 ? '' : 's'}</span></div>
             </div>
             <div style={styles.detailsGrid}>
-              <div style={styles.detailItem}><MapPin size={16} color="#00D9FF" /><div><span style={styles.detailMetaLabel}>SPOT · DISTANCE</span><div style={styles.detailValue}>{candidate.distanceMeters.toFixed(1)} m from your GPS fix</div><div style={styles.detailSubValue}>{candidate.latitude.toFixed(6)}, {candidate.longitude.toFixed(6)}</div></div></div>
+              <div style={styles.detailItem}><MapPin size={16} color="#00D9FF" /><div><span style={styles.detailMetaLabel}>SAVED SPOT · ESTIMATED DISTANCE</span><div style={styles.detailValue}>{candidate.distanceMeters.toFixed(1)} m from the GPS estimate</div><div style={styles.detailSubValue}>{candidate.latitude.toFixed(6)}, {candidate.longitude.toFixed(6)}</div><div style={styles.detailSubValue}>Current browser accuracy estimate: ±{Math.round(candidate.searchGpsAccuracy)} m</div></div></div>
               <div style={styles.detailItem}><Clock size={16} color="#9DB4C8" /><div><span style={styles.detailMetaLabel}>LAST MEASURED · GPS ACCURACY</span><div style={styles.detailValue}>{new Date(candidate.lastMeasured).toLocaleString()}</div><div style={styles.detailSubValue}>Mean recorded accuracy ±{candidate.averageAccuracy.toFixed(1)} m</div></div></div>
               <div style={styles.metricGrid}>
                 <span>Latency <b>{showMetric('latency', candidate.metrics.latencyMs, 'ms', candidate.metricAvailability)}</b></span>
@@ -61,17 +61,21 @@ export const BestSpotCard: React.FC<BestSpotCardProps> = ({ selectedOperator, st
               </div>
             </div>
           </div>
+          {candidate.searchGpsAccuracy > 10 && <p role="status" style={styles.accuracyWarning}>GPS uncertainty (±{Math.round(candidate.searchGpsAccuracy)} m) exceeds the nominal 10 m search radius. The displayed distance is from the GPS estimate; actual proximity may differ.</p>}
           <p style={styles.formula}>Rank = .70×adjusted NQS + .15×sample support + .10×recency + .05×GPS quality. Adjusted NQS = 50 + (recency-weighted NQS − 50)×n/(n+2); sample support = 100×(1−e^(−n/3)); recency = 100×2^(−age/30 days); GPS quality = 100/(1+mean accuracy/10 m). Each record's NQS is weighted with the same 30-day half-life.</p>
         </>
       ) : (
         <div style={styles.emptyState} role={state.status.includes('error') ? 'alert' : 'status'}>
-          <p>{messages[state.status]}</p>
+          <p>{state.status === 'history-error' && state.message ? `${messages[state.status]} ${state.message}` : messages[state.status]}</p>
           {state.status === 'history-error' && <button type="button" style={styles.actionBtn} onClick={onRetryHistory}><RefreshCw size={14} /> Retry History</button>}
-          {['gps-stale', 'gps-invalid', 'gps-inaccurate'].includes(state.status) && <>
+          {['gps-stale', 'gps-invalid'].includes(state.status) && <>
             <button type="button" style={styles.actionBtn} onClick={onRetryLocation}><MapPin size={14} /> Retry Location</button>
             <button type="button" style={styles.actionBtn} onClick={onRetrySearch}><RefreshCw size={14} /> Retry Search</button>
           </>}
-          {state.status === 'no-data' && <button type="button" style={styles.actionBtn} onClick={onMeasureLiveClick}><Activity size={15} /> Measure This Area</button>}
+          {state.status === 'no-data' && <>
+            {state.searchGpsAccuracy > 10 && <p role="status" style={styles.accuracyWarning}>GPS uncertainty is approximately ±{Math.round(state.searchGpsAccuracy)} m, larger than the nominal 10 m search radius. An eligible spot may still be nearby.</p>}
+            <button type="button" style={styles.actionBtn} onClick={onMeasureLiveClick}><Activity size={15} /> Start Measuring Here</button>
+          </>}
           {state.status === 'history-loading' && <span>One moment…</span>}
         </div>
       )}
@@ -100,6 +104,7 @@ const styles: Record<string, React.CSSProperties> = {
   detailSubValue: { fontSize: '.75rem', color: '#9DB4C8' },
   metricGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(120px,1fr))', gap: '8px', color: '#9DB4C8', fontSize: '.75rem' },
   formula: { margin: '8px 0 0', color: '#8299AD', fontSize: '.7rem', lineHeight: 1.5 },
+  accuracyWarning: { margin: '8px 0', padding: 10, borderRadius: 7, color: '#FFE3A3', background: 'rgba(70,48,8,.55)', border: '1px solid rgba(255,211,106,.3)', fontSize: '.75rem', lineHeight: 1.45 },
   emptyState: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '12px', minHeight: '90px', color: '#CBD8E3', lineHeight: 1.5 },
   actionBtn: { display: 'inline-flex', alignItems: 'center', gap: '7px', border: '1px solid rgba(53,244,255,.4)', background: 'rgba(0,217,255,.06)', color: '#35F4FF', borderRadius: '6px', padding: '8px 11px', cursor: 'pointer' }
 };

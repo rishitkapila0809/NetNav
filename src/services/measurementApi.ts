@@ -1,8 +1,9 @@
 import type { LiveMeasurement, TelecomOperator } from '../types';
-import { mapHistoricalRecord, mapHistoricalRecords } from './historicalMeasurements';
+import { mapHistoricalRecord, mapHistoricalRecords, summarizeHistoricalScores } from './historicalMeasurements';
 import { fetchAllMeasurementPages } from './measurementPagination';
 import { selectLatestPersistedMeasurement } from './measurementTelemetry';
 import { resolveMeasurementServerUrl } from './networkMeasurer';
+import { buildMeasurementRequestPayload } from './measurementPayload.ts';
 
 function getApiBase(): string {
   const base = resolveMeasurementServerUrl(import.meta.env.VITE_MEASUREMENT_SERVER_URL, import.meta.env.PROD,
@@ -16,14 +17,27 @@ function diagnosticEndpoint(path: string): string {
   catch { return path; }
 }
 
-export async function saveMeasurement(measurement: LiveMeasurement): Promise<void> {
+export async function saveMeasurement(measurement: LiveMeasurement, signal?: AbortSignal): Promise<void> {
   const endpoint = diagnosticEndpoint('/api/measurements');
+  const requestController = new AbortController();
+  const timedOutController = { value: false };
+  const timeoutId = setTimeout(() => {
+    timedOutController.value = true;
+    requestController.abort(new DOMException('Measurement save timed out', 'TimeoutError'));
+  }, 20_000);
+  const abortRequest = () => requestController.abort(signal?.reason);
+  if (signal?.aborted) abortRequest();
+  else signal?.addEventListener('abort', abortRequest, { once: true });
   let response: Response;
   try {
-    response = await fetch(`${getApiBase()}/api/measurements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(measurement) });
+    const payload = buildMeasurementRequestPayload(measurement);
+    response = await fetch(`${getApiBase()}/api/measurements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: requestController.signal });
   } catch (error) {
-    console.error(`[NETNAV STORAGE] POST ${endpoint} failed before receiving an HTTP response:`, error instanceof Error ? error.message : String(error));
-    throw new Error('Measurement API could not be reached');
+    if (!signal?.aborted) console.error(`[NETNAV STORAGE] POST ${endpoint} failed before receiving an HTTP response:`, error instanceof Error ? error.message : String(error));
+    throw new Error(signal?.aborted ? 'Measurement save was cancelled' : timedOutController.value ? 'Measurement API save timed out' : 'Measurement API could not be reached');
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abortRequest);
   }
   if (import.meta.env.DEV) console.info(`[NETNAV STORAGE] POST ${endpoint} returned HTTP ${response.status}`);
   if (!response.ok) {
@@ -35,6 +49,10 @@ export async function saveMeasurement(measurement: LiveMeasurement): Promise<voi
 
 export async function loadMeasurements(operator?: TelecomOperator, options: { limit?: number; before?: string; beforeId?: string } = {}): Promise<LiveMeasurement[]> {
   const rows = await fetchMeasurementRecords(operator, options);
+  if (import.meta.env.DEV) {
+    const scoreSummary = summarizeHistoricalScores(rows);
+    console.info(`[NETNAV HISTORY] loaded=${scoreSummary.loaded}, valid nqs=${scoreSummary.validNqs}, trusted quality-v2 nqs=${scoreSummary.trustedNqs}, legacy/unverified=${scoreSummary.legacyOrUnverified}, ineligible=${scoreSummary.ineligible}; score field=nqs`);
+  }
   const measurements: LiveMeasurement[] = mapHistoricalRecords({ measurements: rows });
   if (import.meta.env.DEV) console.info(`[NETNAV STORAGE] GET ${diagnosticEndpoint('/api/measurements')} returned ${measurements.length} saved measurement(s)`);
   return measurements;

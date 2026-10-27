@@ -76,6 +76,10 @@ $$\text{NQS} = 0.25 L + 0.30 T + 0.20 P + 0.10 J + 0.15 S$$
 
 $$\text{NQS} = \min\left(100, \max\left(0, \text{round}\left(\frac{0.25L + 0.30T + 0.20P + 0.10J}{0.85}\right)\right)\right)$$
 
+Unavailable components are omitted and the remaining weights are renormalized. To avoid a perfect score from a very small early-session sample, NetNav displays and accepts an NQS only when at least `0.70` of the original formula weight is supported by valid metrics. With signal unavailable, the measurable total is `0.85`; for example, latency + download + jitter alone provide only `0.65`, so NQS remains unavailable until more evidence arrives. This evidence threshold does not change the formula or metric normalization thresholds.
+
+For wire compatibility with older API deployments, the request may include `packetLossPercent` as an alias of `probeFailurePercent`, and `metricAvailability.packetLoss` as an alias of `metricAvailability.probeFailure`. Both names mean HTTP probe failure rate, never IP or cellular packet loss. When unavailable, both numeric aliases are `null` and both availability flags are `false`; a zero is sent only for an observed 0% rate.
+
 ---
 
 ## 📱 Mobile Browser Capabilities & Limitations
@@ -109,7 +113,7 @@ Because NetNav decouples lightweight 1 Hz latency probes from throttled throughp
 3. Install dependencies with `npm install`, then run `npm run migrate` to create the `network_measurements` table and indexes. The migration uses additive `CREATE TABLE/INDEX IF NOT EXISTS` statements.
 4. Start the API with `npm run server`. Data endpoints return 503 until `DATABASE_URL` and the migration are configured.
 
-The API supports `POST /api/measurements` and `GET /api/measurements?operator=Jio&limit=100&before=<ISO timestamp>`. History is newest-first and limited to 500 records per request. Server validation recalculates NQS using the existing locked formula. Automated tests use a fake repository and never connect to Neon.
+The API supports `POST /api/measurements` and `GET /api/measurements?operator=Jio&limit=100&before=<ISO timestamp>`. History is newest-first and limited to 500 records per request. Server validation recalculates NQS using the existing locked formula and rejects samples without at least `0.70` available component weight. Automated tests use a fake repository and never connect to Neon.
 
 ## Telemetry and map location search
 
@@ -121,10 +125,10 @@ The telemetry panel shows the newest current-session sample for the selected ope
 - Jitter is `abs(current successful HTTP response time - previous successful HTTP response time)`, in milliseconds. Failed requests do not contribute an invented RTT.
 - Reliability is failed HTTP probes divided by the last 10 probe outcomes. It is unavailable until the complete window exists and is not IP packet loss. The UI/API use “HTTP probe failure”; the legacy physical PostgreSQL column name is `probe_failure_percent`.
 - Download uses the validated received byte count and upload requires the server's exact byte-count acknowledgement. The client times through receipt of each response. Regular tests transfer 768 KiB down and 256 KiB up every 25 seconds. These are short application-level throughput samples, not sustained carrier speed tests; payload size, buffering, and server/browser behavior affect results. A failed refresh is unavailable instead of reusing an older value.
-- New persisted measurements require valid GPS coordinates, a fix no older than 10 seconds, and reported accuracy of 10 metres or better. Accuracy is the browser's estimate, not a guarantee of physical precision.
+- New persisted measurements require valid GPS coordinates, a fix no older than 10 seconds, and valid browser-reported accuracy up to 10,000 metres. Fixes above the preferred 10-metre target remain usable with an explicit uncertainty warning; accuracy is the browser's estimate, not a guarantee of physical precision.
 - Operator is a manually selected attribution label. Browser APIs do not verify which SIM or carrier actually served the request.
 - Standard browser APIs do not provide reliable RSRP, RSRQ, SINR, or Wi-Fi RSSI. Signal remains unavailable and excluded from NQS; native OS instrumentation would be needed.
 
-The normalization thresholds are unchanged: latency 15–300 ms, download 0–100 Mbps, HTTP probe failure 0–20%, and jitter 2–50 ms. Each valid available metric is normalized to 0–100; unavailable components are omitted and available weights are renormalized. A low NQS can therefore follow from low measured download throughput, HTTP failures, high latency/jitter, or their combination; it does not by itself indicate a formula defect.
+The normalization thresholds are unchanged: latency 15–300 ms, download 0–100 Mbps, HTTP probe failure 0–20%, and jitter 2–50 ms. Each valid available metric is normalized to 0–100; unavailable components are omitted and available weights are renormalized, subject to the `0.70` minimum evidence threshold above. A low NQS can therefore follow from low measured download throughput, HTTP failures, high latency/jitter, or their combination; it does not by itself indicate a formula defect.
 
 Map search uses the Google Maps JavaScript Geocoder, not Places Autocomplete. Enable the Google **Geocoding API** and billing for the key's Google Cloud project, and restrict the browser key to deployed HTTP referrers and required APIs. Saved measurements shown for a selected search result must match the selected operator and fall within 100 metres of the result coordinates.

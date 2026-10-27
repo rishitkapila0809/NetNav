@@ -1,5 +1,5 @@
 import type { LiveMeasurement, TelecomOperator } from '../types';
-import { networkMeasurer } from './networkMeasurer.ts';
+import { MIN_NQS_AVAILABLE_WEIGHT, networkMeasurer } from './networkMeasurer.ts';
 
 export const NQS_FORMULA_VERSION = 'LTPJ-renormalized-v1';
 export type TelemetrySource = 'live' | 'persisted';
@@ -40,7 +40,8 @@ export function calculateMeasurementNqs(row: LiveMeasurement): MeasurementNqsEva
   ];
   const components = candidates.map((component) => ({ ...component, contribution: component.score === null ? null : component.weight * component.score }));
   const availableWeight = components.reduce((sum, component) => sum + (component.score === null ? 0 : component.weight), 0);
-  if (!availableWeight || availability.signal === true) return { nqs: null, verification: availability.signal === true ? 'unsupported-signal' : 'unavailable', availableWeight, components };
+  if (availability.signal === true) return { nqs: null, verification: 'unsupported-signal', availableWeight, components };
+  if (availableWeight < MIN_NQS_AVAILABLE_WEIGHT) return { nqs: null, verification: 'unavailable', availableWeight, components };
   const score = Math.round(components.reduce((sum, component) => sum + (component.contribution ?? 0), 0) / availableWeight);
   const verification = score === row.nqs ? 'match' : 'mismatch';
   return { nqs: score, verification, availableWeight, components };

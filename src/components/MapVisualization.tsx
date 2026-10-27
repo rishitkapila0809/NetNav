@@ -10,6 +10,7 @@ import type { RouteCoordinate, WalkingRouteOption } from '../services/walkingRou
 import type { RankedWalkingRoute } from '../services/routeRanking';
 import { MapLocationSearch } from './MapLocationSearch';
 import type { MapSearchResult } from '../services/mapLocationSearch';
+import type { LocationTrackerStatus } from '../services/locationTracker';
 
 interface MapVisualizationProps {
   selectedOperator: TelecomOperator;
@@ -49,9 +50,11 @@ interface MapVisualizationProps {
   overlayTruncated?: boolean;
   onRetryOverlay?: () => void;
   isMeasuring?: boolean;
+  locationFresh?: boolean;
+  locationHasFix?: boolean;
   sessionSummary?: MeasurementSessionSummary | null;
   onUserLocationChange?: (coords: { lat: number; lng: number; accuracy: number; speed: number | null; heading: number | null; timestamp?: number }) => void;
-  onLocationStatusChange?: (status: 'idle' | 'locating' | 'active' | 'denied' | 'error', message: string | null) => void;
+  onLocationStatusChange?: (status: LocationTrackerStatus, message: string | null) => void;
   navigationProgress?: { remainingMeters: number; progressPercent: number; remainingSeconds: number; distanceFromRouteMeters: number } | null;
   navigationGpsMessage?: string;
   liveNavigationActive?: boolean;
@@ -111,6 +114,8 @@ export const MapVisualization: React.FC<MapVisualizationProps> = ({
   overlayTruncated = false,
   onRetryOverlay,
   isMeasuring = false,
+  locationFresh,
+  locationHasFix,
   sessionSummary = null,
   onUserLocationChange,
   onLocationStatusChange,
@@ -184,6 +189,8 @@ export const MapVisualization: React.FC<MapVisualizationProps> = ({
           searchPosition={mapSearchSelection?.position ?? null}
           searchLabel={mapSearchSelection?.name ?? null}
           isMeasuring={isMeasuring}
+          locationFresh={locationFresh}
+          locationHasFix={locationHasFix}
           sessionSummary={sessionSummary}
           onUserLocationChange={onUserLocationChange}
           onLocationStatusChange={onLocationStatusChange}

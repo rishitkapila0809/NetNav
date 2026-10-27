@@ -6,6 +6,7 @@ import { Activity, Play, Square, Info, ChevronDown, ChevronUp, MapPin, Gauge, Ar
 interface LiveMeasurementCardProps {
   isMeasuring: boolean;
   currentMeasurement: LiveMeasurement | null;
+  storageState: { status: 'score-ineligible' | 'persistence-ineligible' | 'pending' | 'saved' | 'failed' | 'unknown'; error?: string } | null;
   measurementCount: number;
   sessionSummary: MeasurementSessionSummary | null;
   onStartMeasuring: () => void;
@@ -15,6 +16,7 @@ interface LiveMeasurementCardProps {
 export const LiveMeasurementCard: React.FC<LiveMeasurementCardProps> = ({
   isMeasuring,
   currentMeasurement,
+  storageState,
   measurementCount,
   sessionSummary,
   onStartMeasuring,
@@ -138,6 +140,11 @@ export const LiveMeasurementCard: React.FC<LiveMeasurementCardProps> = ({
             )}
             {currentMeasurement && <div style={{ ...styles.liveCoordsFooter, marginTop: 4 }}>
               <span>{currentMeasurement.operator} · Live session sample · {new Date(currentMeasurement.timestamp).toLocaleString()}</span>
+            </div>}
+            {currentMeasurement && storageState && <div style={{ ...styles.liveCoordsFooter, marginTop: 4 }} role="status" aria-live="polite">
+              <span>
+                {storageState.status === 'score-ineligible' ? 'NQS: insufficient valid metrics' : storageState.status === 'persistence-ineligible' ? 'NQS eligible; sample not eligible for persistence' : `Storage: ${storageState.status === 'saved' ? 'saved to history' : storageState.status === 'pending' ? 'saving…' : storageState.status === 'failed' ? `save failed${storageState.error ? ` — ${storageState.error}` : ''}` : storageState.status === 'unknown' ? `save outcome unknown${storageState.error ? ` — ${storageState.error}` : ''}` : 'not eligible'}`}
+              </span>
             </div>}
           </div>
 

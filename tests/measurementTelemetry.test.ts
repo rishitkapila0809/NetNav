@@ -21,12 +21,15 @@ describe('measurement-backed telemetry', () => {
     assert.equal(calculateMeasurementNqs(changed).verification, 'match');
   });
 
-  test('excludes genuinely unavailable metrics and renormalizes remaining weights', () => {
-    const partial = { ...base, latencyMs: 300, downloadMbps: 0, probeFailurePercent: 0, jitterMs: 50, nqs: 67,
-      metricAvailability: { latency: true, download: false, upload: false, jitter: false, probeFailure: true, signal: false } };
-    assert.equal(calculateMeasurementNqs(partial).nqs, 44);
-    assert.equal(calculateMeasurementNqs(partial).verification, 'mismatch');
+  test('excludes unavailable metrics, renormalizes valid weights, and requires sufficient evidence', () => {
+    const partial = { ...base, latencyMs: 300, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 50, nqs: 67,
+      metricAvailability: { latency: true, download: true, upload: false, jitter: false, probeFailure: true, signal: false } };
+    assert.equal(calculateMeasurementNqs(partial).nqs, 67);
+    assert.equal(calculateMeasurementNqs(partial).verification, 'match');
     assert.equal(calculateMeasurementNqs({ ...partial, metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } }).nqs, null);
+    const oneMetric = { ...base, metricAvailability: { latency: false, download: false, upload: false, jitter: true, probeFailure: false, signal: false } };
+    assert.equal(calculateMeasurementNqs(oneMetric).nqs, null);
+    assert.equal(calculateMeasurementNqs(oneMetric).availableWeight, 0.1);
   });
 
   test('reports unsupported signal normalization and never rewrites a stored score', () => {

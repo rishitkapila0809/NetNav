@@ -1,6 +1,8 @@
 import type { LiveMeasurement, MeasurementMethodVersion, NetworkStatus, TelecomOperator } from '../types';
 
 export const MEASUREMENT_METHOD_VERSION: MeasurementMethodVersion = 'quality-v2';
+/** Require at least 70% of the formula's original weight to be backed by valid metrics. */
+export const MIN_NQS_AVAILABLE_WEIGHT = 0.70;
 
 export interface MeasurementConfig {
   /** Base URL of the measurement server (e.g. 'http://localhost:3001') */
@@ -449,6 +451,25 @@ export class NetworkMeasurerService {
     const { nqs, raw: rawNqs, scores } = scoreResult;
     const status = this.getNqsStatus(scoreResult.available ? nqs : null);
 
+    if (typeof import.meta.env !== 'undefined' && import.meta.env.DEV && (!scoreResult.available || nqs === 100)) {
+      console.debug('[NETNAV NQS] current sample calculation', {
+        timestamp: new Date().toISOString(), operator,
+        raw: {
+          latencyMs: availability.latency ? latencyMs : null,
+          downloadMbps: availability.download ? downloadMbps : null,
+          uploadMbps: availability.upload ? uploadMbps : null,
+          httpProbeFailurePercent: availability.probeFailure ? probeFailurePercent : null,
+          jitterMs: availability.jitter ? jitterMs : null,
+          signalDbm: null
+        },
+        available: { ...availability },
+        normalizedScores: scores,
+        availableWeight: scoreResult.availableWeight,
+        formulaValue: rawNqs,
+        displayedNqs: scoreResult.available ? nqs : null
+      });
+    }
+
     return {
       id: `meas-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       latitude,
@@ -546,7 +567,7 @@ export class NetworkMeasurerService {
     probeFailurePercent: number;
     jitterMs: number;
     availability: { latency: boolean; download: boolean; probeFailure: boolean; jitter: boolean };
-  }): { nqs: number; raw: number | null; available: boolean; scores: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null } } {
+  }): { nqs: number; raw: number | null; available: boolean; availableWeight: number; scores: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null } } {
     const scores = {
       latency: input.availability.latency && Number.isFinite(input.latencyMs) && input.latencyMs >= 0 && input.latencyMs <= 600000 ? this.calcLatencyScore(input.latencyMs) : null,
       throughput: input.availability.download && Number.isFinite(input.downloadMbps) && input.downloadMbps >= 0 && input.downloadMbps <= 100000 ? this.calcThroughputScore(input.downloadMbps) : null,
@@ -561,7 +582,8 @@ export class NetworkMeasurerService {
       if (score !== null) { numerator += weights[key] * score; denominator += weights[key]; }
     }
     const raw = denominator > 0 ? numerator / denominator : null;
-    return { nqs: raw === null ? 0 : Math.min(100, Math.max(0, Math.round(raw))), raw, available: raw !== null, scores };
+    const available = raw !== null && denominator >= MIN_NQS_AVAILABLE_WEIGHT;
+    return { nqs: !available ? 0 : Math.min(100, Math.max(0, Math.round(raw!))), raw: available ? raw : null, available, availableWeight: denominator, scores };
   }
 
   public getNqsStatus(nqs: number | null): NetworkStatus {
