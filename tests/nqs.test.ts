@@ -26,12 +26,12 @@ describe('NQS Normalization and Locked Formula Tests', () => {
     assert.strictEqual(measurer.calcThroughputScore(80.5), 81);
   });
 
-  test('Packet loss / probe failure rate score: <= 0% is 100, >= 20% is 0, linear between', () => {
-    assert.strictEqual(measurer.calcPacketLossScore(0), 100);
-    assert.strictEqual(measurer.calcPacketLossScore(-1), 100);
-    assert.strictEqual(measurer.calcPacketLossScore(20), 0);
-    assert.strictEqual(measurer.calcPacketLossScore(30), 0);
-    assert.strictEqual(measurer.calcPacketLossScore(10), 50);
+  test('HTTP probe failure score: <= 0% is 100, >= 20% is 0, linear between', () => {
+    assert.strictEqual(measurer.calcProbeFailureScore(0), 100);
+    assert.strictEqual(measurer.calcProbeFailureScore(-1), 100);
+    assert.strictEqual(measurer.calcProbeFailureScore(20), 0);
+    assert.strictEqual(measurer.calcProbeFailureScore(30), 0);
+    assert.strictEqual(measurer.calcProbeFailureScore(10), 50);
   });
 
   test('Jitter normalization score: <= 2ms is 100, >= 50ms is 0, linear between', () => {

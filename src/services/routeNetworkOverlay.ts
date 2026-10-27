@@ -63,7 +63,7 @@ export function distancePointToSegmentMeters(point: RouteCoordinate, start: Rout
 
 function validMeasurement(row: LiveMeasurement, operator: TelecomOperator, now: number): boolean {
   const timestamp = Date.parse(row.timestamp);
-  return row.operator === operator && Number.isFinite(row.latitude) && row.latitude >= -90 && row.latitude <= 90 &&
+  return row.operator === operator && row.measurementMethodVersion !== 'legacy-v1' && row.status !== 'UNAVAILABLE' && Number.isFinite(row.latitude) && row.latitude >= -90 && row.latitude <= 90 &&
     Number.isFinite(row.longitude) && row.longitude >= -180 && row.longitude <= 180 && Number.isFinite(row.accuracy) && row.accuracy >= 0 && row.accuracy <= 10000 &&
     Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100 && Number.isFinite(timestamp) && timestamp <= now;
 }

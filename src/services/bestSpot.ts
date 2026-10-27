@@ -11,7 +11,7 @@ export interface BestSpotGps { lat: number; lng: number; accuracy: number; times
 export interface BestSpotCandidate {
   latitude: number; longitude: number; distanceMeters: number; operator: TelecomOperator;
   nqs: number; rankScore: number; sampleCount: number; lastMeasured: string; averageAccuracy: number;
-  metrics: { latencyMs?: number; downloadMbps?: number; uploadMbps?: number; jitterMs?: number; packetLossPercent?: number; signalDbm?: number };
+  metrics: { latencyMs?: number; downloadMbps?: number; uploadMbps?: number; jitterMs?: number; probeFailurePercent?: number; signalDbm?: number };
   metricAvailability: Record<string, boolean>;
 }
 export type BestSpotResult =
@@ -32,14 +32,15 @@ function validGps(gps: BestSpotGps): boolean {
 
 function validMeasurement(row: LiveMeasurement, operator: TelecomOperator, now: number): boolean {
   const measuredAt = Date.parse(row.timestamp);
-  return row.operator === operator && Number.isFinite(row.latitude) && row.latitude >= -90 && row.latitude <= 90 &&
-    Number.isFinite(row.longitude) && row.longitude >= -180 && row.longitude <= 180 && Number.isFinite(row.accuracy) && row.accuracy >= 0 && row.accuracy <= 10000 &&
+  return row.operator === operator && row.measurementMethodVersion !== 'legacy-v1' && row.status !== 'UNAVAILABLE' &&
+    Number.isFinite(row.latitude) && row.latitude >= -90 && row.latitude <= 90 &&
+    Number.isFinite(row.longitude) && row.longitude >= -180 && row.longitude <= 180 && Number.isFinite(row.accuracy) && row.accuracy >= 0 && row.accuracy <= 10 &&
     Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100 && Number.isFinite(measuredAt) && measuredAt <= now &&
-    ['latencyMs', 'downloadMbps', 'uploadMbps', 'jitterMs', 'packetLossPercent'].every((key) => {
+    ['latencyMs', 'downloadMbps', 'uploadMbps', 'jitterMs', 'probeFailurePercent'].every((key) => {
       const value = row[key as keyof LiveMeasurement];
       if (value === undefined || value === null) return true;
       if (typeof value !== 'number' || !Number.isFinite(value)) return false;
-      const max = key === 'downloadMbps' || key === 'uploadMbps' ? 100000 : key === 'packetLossPercent' ? 100 : 600000;
+      const max = key === 'downloadMbps' || key === 'uploadMbps' ? 100000 : key === 'probeFailurePercent' ? 100 : 600000;
       return value >= 0 && value <= max;
     }) && (row.signalDbm === undefined || (Number.isFinite(row.signalDbm) && row.signalDbm >= -200 && row.signalDbm <= 0));
 }
@@ -76,10 +77,10 @@ function makeCandidate(rows: LiveMeasurement[], gps: BestSpotGps, now: number): 
   const metrics = {
     latencyMs: averageMetric(rows, 'latency', 'latencyMs'), downloadMbps: averageMetric(rows, 'download', 'downloadMbps'),
     uploadMbps: averageMetric(rows, 'upload', 'uploadMbps'), jitterMs: averageMetric(rows, 'jitter', 'jitterMs'),
-    packetLossPercent: averageMetric(rows, 'packetLoss', 'packetLossPercent'), signalDbm: averageMetric(rows, 'signal', 'signalDbm')
+    probeFailurePercent: averageMetric(rows, 'probeFailure', 'probeFailurePercent'), signalDbm: averageMetric(rows, 'signal', 'signalDbm')
   };
   for (const [key, value] of Object.entries({ latency: metrics.latencyMs, download: metrics.downloadMbps, upload: metrics.uploadMbps,
-    jitter: metrics.jitterMs, packetLoss: metrics.packetLossPercent, signal: metrics.signalDbm })) metricAvailability[key] = value !== undefined;
+    jitter: metrics.jitterMs, probeFailure: metrics.probeFailurePercent, signal: metrics.signalDbm })) metricAvailability[key] = value !== undefined;
   return { latitude, longitude, distanceMeters: distanceMeters(gps, { lat: latitude, lng: longitude }), operator: rows[0].operator,
     nqs: Math.round(nqs), rankScore: Math.round(rankScore * 10) / 10, sampleCount: rows.length, lastMeasured,
     averageAccuracy, metrics, metricAvailability };

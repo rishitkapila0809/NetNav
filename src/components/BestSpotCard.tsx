@@ -56,7 +56,7 @@ export const BestSpotCard: React.FC<BestSpotCardProps> = ({ selectedOperator, st
                 <span>Download <b>{showMetric('download', candidate.metrics.downloadMbps, 'Mbps', candidate.metricAvailability)}</b></span>
                 <span>Upload <b>{showMetric('upload', candidate.metrics.uploadMbps, 'Mbps', candidate.metricAvailability)}</b></span>
                 <span>Jitter <b>{showMetric('jitter', candidate.metrics.jitterMs, 'ms', candidate.metricAvailability)}</b></span>
-                <span>Probe failure <b>{showMetric('packetLoss', candidate.metrics.packetLossPercent, '%', candidate.metricAvailability)}</b></span>
+                <span>Probe failure <b>{showMetric('probeFailure', candidate.metrics.probeFailurePercent, '%', candidate.metricAvailability)}</b></span>
                 <span>Signal <b>{showMetric('signal', candidate.metrics.signalDbm, 'dBm', candidate.metricAvailability)}</b></span>
               </div>
             </div>

@@ -1,8 +1,7 @@
 import React from 'react';
 import type { LiveMeasurement, TelecomOperator, MeasurementSessionSummary } from '../types';
-import { MOCK_STATS_SUMMARY } from '../data/mockData';
 import { CampusMap } from './CampusMap';
-import { Layers, ShieldCheck, Cpu } from 'lucide-react';
+import { Layers } from 'lucide-react';
 import { filterHistoricalMeasurements, type HistoryStatus, type OperatorFilter } from '../services/historicalMeasurements';
 import type { BestSpotCandidate } from '../services/bestSpot';
 import { RoutePlannerPanel, type RoutePickMode } from './RoutePlannerPanel';
@@ -122,6 +121,7 @@ export const MapVisualization: React.FC<MapVisualizationProps> = ({
   rerouteState = 'idle', rerouteError = null, rerouteRoutes = [], onStartLiveNavigation, onEndLiveNavigation, onRequestReroute, onApplyReroute, onRetryLocation,
   mapSearchSelection = null, nearbySearchMeasurements = [], nearbySearchStatus = 'idle', nearbySearchError = null, onSelectMapSearchLocation, onMeasureSearchedArea, onRetryNearbySearch
 }) => {
+  const visibleHistoricalCount = filterHistoricalMeasurements(historicalMeasurements, historyOperator).length;
   return (
     <div style={styles.container} className="glass-panel map-panel">
       {/* Map Header HUD Bar */}
@@ -217,15 +217,13 @@ export const MapVisualization: React.FC<MapVisualizationProps> = ({
       {/* Map Footer Intelligence HUD Bar */}
       <div style={styles.hudFooter} className="map-hud-footer">
         <div style={styles.hudFooterStat}>
-          <Cpu size={14} color="#00D9FF" />
-          <span>Active Nodes: <strong>{MOCK_STATS_SUMMARY.totalActiveNodes + liveMeasurements.length}</strong></span>
+          <span>Live samples: <strong>{liveMeasurements.length}</strong></span>
         </div>
         <div style={styles.hudFooterStat}>
-          <ShieldCheck size={14} color="#00E676" />
-          <span>Operator Spectrum: <strong>{selectedOperator} 5G/4G</strong></span>
+          <span>Operator tag: <strong>{selectedOperator} (manual)</strong></span>
         </div>
         <div style={styles.hudFooterStat}>
-          <span>Area Covered: <strong>{MOCK_STATS_SUMMARY.coverageAreaKm2} km²</strong></span>
+          <span>Saved records in filter: <strong>{historyStatus === 'loaded' ? visibleHistoricalCount : '—'}</strong></span>
         </div>
       </div>
     </div>

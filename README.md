@@ -24,7 +24,7 @@ Open the printed local URL (e.g., `http://localhost:5173` or `http://<your-lan-i
 ```bash
 npm test
 ```
-Runs the full suite of unit and integration tests (16 tests covering NQS normalization, active throughput, latency probes, timeouts, offline detection, and session cancellation).
+Runs the full suite of unit and integration tests (currently 96 tests, including controlled local HTTP endpoint tests, metric validation, historical telemetry, route ranking, and navigation helpers).
 
 ---
 
@@ -54,9 +54,11 @@ NetNav Frontend (Browser)
 ### Endpoints Implemented
 
 1. **`GET /health`**: Verifies server health with anti-caching headers.
-2. **`GET /probe`**: Returns an ultra-compact JSON response `{ ok: true, t: ... }` for sub-millisecond overhead RTT latency measurement.
-3. **`GET /download?bytes=N`**: Streams binary data to measure genuine downlink speed in Mbps ($(\text{bytes} \times 8) / (\text{durationSec} \times 10^6)$).
-4. **`POST /upload`**: Accepts a bounded binary payload to measure genuine uplink speed in Mbps without storing test files.
+2. **`GET /probe`**: Returns `{ ok: true, t: ... }`. The browser times the fetch through response-body receipt. This is HTTP request/response time to the configured server, not ICMP ping or isolated radio latency. DNS, connection setup, TLS, server wake-up/load, and browser scheduling can affect it.
+3. **`GET /download?bytes=N`**: Streams a bounded binary payload (up to 10 MiB). The client verifies the received byte count and calculates Mbps from actual bytes and elapsed time. This is a short application-level transfer sample, not sustained carrier speed.
+4. **`POST /upload`**: Accepts and counts a bounded binary payload (up to 10 MiB), then returns the exact received byte count. The client requires a matching acknowledgement and times through its receipt. This includes the HTTP response path and is not a radio-only uplink rate.
+
+The frontend uses `VITE_MEASUREMENT_SERVER_URL` when configured. Development can use a local server URL; production fails closed unless configured with a non-loopback HTTPS server URL. Set it to the deployed Render service URL for production.
 
 ---
 
@@ -66,10 +68,10 @@ NetNav calculates the Network Quality Score using the locked formula:
 
 $$\text{NQS} = 0.25 L + 0.30 T + 0.20 P + 0.10 J + 0.15 S$$
 
-- **$L$ (Latency Score):** Normalized from external RTT latency ($\le 15\text{ms} \to 100$, $\ge 300\text{ms} \to 0$).
+- **$L$ (Latency Score):** Normalized from browser HTTP response time to `/probe` ($\le 15\text{ms} \to 100$, $\ge 300\text{ms} \to 0$).
 - **$T$ (Throughput Score):** Normalized from active download throughput ($\ge 100\text{ Mbps} \to 100$, $\le 0 \to 0$).
-- **$P$ (Probe Failure Rate):** Percentage of failed probes over the last 10 attempts ($\le 0\% \to 100$, $\ge 20\% \to 0$).
-- **$J$ (Jitter Score):** Inter-probe latency variation $\lvert \text{RTT}_t - \text{RTT}_{t-1} \rvert$ ($\le 2\text{ms} \to 100$, $\ge 50\text{ms} \to 0$).
+- **$P$ (HTTP Probe Failure Rate):** Percentage of failed HTTP probes in the rolling 10-attempt window ($\le 0\% \to 100$, $\ge 20\% \to 0$). It is unavailable until all 10 observations exist; HTTP failures are not IP packet loss.
+- **$J$ (Jitter Score):** Absolute difference between successive successful HTTP response-time samples ($\le 2\text{ms} \to 100$, $\ge 50\text{ms} \to 0$). It is unavailable until two successful latency samples exist.
 - **$S$ (Signal Strength):** Browser sandboxing does not expose cellular RSRP/dBm. $S$ is honestly reported as `UNAVAILABLE` and the score is renormalized by dividing by the sum of available weights ($0.85$):
 
 $$\text{NQS} = \min\left(100, \max\left(0, \text{round}\left(\frac{0.25L + 0.30T + 0.20P + 0.10J}{0.85}\right)\right)\right)$$
@@ -84,7 +86,7 @@ $$\text{NQS} = \min\left(100, \max\left(0, \text{round}\left(\frac{0.25L + 0.30T
 - **HTTP Probe Loss Rate:** Percentage of timed-out or dropped HTTP probes.
 - **Active Downlink Throughput:** Mbps calculated from actual binary bytes streamed.
 - **Active Uplink Throughput:** Mbps calculated from actual binary bytes posted.
-- **High-Accuracy Geolocation:** GPS coordinates, speed, heading, and accuracy radius.
+- **Browser geolocation:** Coordinates, speed, heading, and browser-reported accuracy radius when available; saved measurements require a fresh fix with reported accuracy of 10 m or better.
 
 ### Mobile Browser Restrictions (By W3C Design):
 - **Cellular Signal (RSRP / RSRQ / SINR / RSSI):** Cannot be read by web browsers without a native Android (Java/Kotlin) or iOS app.
@@ -111,6 +113,18 @@ The API supports `POST /api/measurements` and `GET /api/measurements?operator=Ji
 
 ## Telemetry and map location search
 
-The telemetry panel shows the newest current-session sample for the selected operator when it is newer than saved history; otherwise it shows the newest valid persisted sample. Unavailable metrics are shown as N/A. The current browser formula version is `LTPJ-renormalized-v1`: latency (0.25), download (0.30), HTTP probe failure rate (0.20), and jitter (0.10), renormalized across available metrics. Signal is unavailable in the browser and is not scored. The database does not store an NQS formula-version field, so historical records remain unchanged and the UI compares their saved NQS with the current formula, flagging mismatches or unverifiable rows.
+The telemetry panel shows the newest current-session sample for the selected operator when it is newer than saved history; otherwise it shows the newest valid persisted sample. Unavailable metrics are shown as N/A. The current browser formula version is `LTPJ-renormalized-v1`: latency (0.25), download (0.30), HTTP probe failure rate (0.20), and jitter (0.10), renormalized across available metrics. Signal is unavailable in the browser and is not scored. New quality-v2 records store `_methodVersion` in the existing `metric_availability` JSONB column, without rewriting prior records. Rows without this marker are treated as legacy/unverified, shown with a warning, and excluded from corrected Find Best Spot and route-quality scoring. The telemetry view compares eligible saved scores with the current formula where the stored metrics permit verification.
+
+### Measurement interpretation and limitations
+
+- Latency uses `performance.now()` around a browser fetch to `/probe` through receipt of its response body. It is HTTP request/response time to the configured measurement server, not ICMP ping or isolated radio latency. DNS, connection setup, TLS, server wake-up/load, and browser scheduling can affect it, especially on a first request.
+- Jitter is `abs(current successful HTTP response time - previous successful HTTP response time)`, in milliseconds. Failed requests do not contribute an invented RTT.
+- Reliability is failed HTTP probes divided by the last 10 probe outcomes. It is unavailable until the complete window exists and is not IP packet loss. The UI/API use “HTTP probe failure”; the legacy physical PostgreSQL column name is `probe_failure_percent`.
+- Download uses the validated received byte count and upload requires the server's exact byte-count acknowledgement. The client times through receipt of each response. Regular tests transfer 768 KiB down and 256 KiB up every 25 seconds. These are short application-level throughput samples, not sustained carrier speed tests; payload size, buffering, and server/browser behavior affect results. A failed refresh is unavailable instead of reusing an older value.
+- New persisted measurements require valid GPS coordinates, a fix no older than 10 seconds, and reported accuracy of 10 metres or better. Accuracy is the browser's estimate, not a guarantee of physical precision.
+- Operator is a manually selected attribution label. Browser APIs do not verify which SIM or carrier actually served the request.
+- Standard browser APIs do not provide reliable RSRP, RSRQ, SINR, or Wi-Fi RSSI. Signal remains unavailable and excluded from NQS; native OS instrumentation would be needed.
+
+The normalization thresholds are unchanged: latency 15–300 ms, download 0–100 Mbps, HTTP probe failure 0–20%, and jitter 2–50 ms. Each valid available metric is normalized to 0–100; unavailable components are omitted and available weights are renormalized. A low NQS can therefore follow from low measured download throughput, HTTP failures, high latency/jitter, or their combination; it does not by itself indicate a formula defect.
 
 Map search uses the Google Maps JavaScript Geocoder, not Places Autocomplete. Enable the Google **Geocoding API** and billing for the key's Google Cloud project, and restrict the browser key to deployed HTTP referrers and required APIs. Saved measurements shown for a selected search result must match the selected operator and fall within 100 metres of the result coordinates.

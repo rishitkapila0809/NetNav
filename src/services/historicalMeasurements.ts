@@ -4,7 +4,7 @@ import { networkMeasurer } from './networkMeasurer.ts';
 export type HistoryStatus = 'loading' | 'loaded' | 'error';
 export type OperatorFilter = 'All' | TelecomOperator;
 const operators = new Set<TelecomOperator>(['Jio', 'Airtel', 'Vi', 'BSNL']);
-const availabilityKeys = ['latency', 'download', 'upload', 'jitter', 'packetLoss', 'signal'] as const;
+const availabilityKeys = ['latency', 'download', 'upload', 'jitter', 'probeFailure', 'signal'] as const;
 
 function numeric(value: unknown, min: number, max: number, optional = false): number | undefined {
   if ((value === null || value === undefined || value === '') && optional) return undefined;
@@ -20,12 +20,19 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
   const accuracy = numeric(row.accuracy, 0, 10000);
   const nqs = numeric(row.nqs, 0, 100);
   const timestamp = new Date(String(row.timestamp));
-  if (latitude === undefined || longitude === undefined || accuracy === undefined || nqs === undefined || !Number.isFinite(timestamp.getTime())) return null;
+  if (latitude === undefined || longitude === undefined || accuracy === undefined || nqs === undefined || !Number.isFinite(timestamp.getTime()) || timestamp.getTime() > Date.now() + 300_000) return null;
 
-  const rawAvailability = row.metricAvailability && typeof row.metricAvailability === 'object'
+  const rawAvailability = row.metricAvailability && typeof row.metricAvailability === 'object' && !Array.isArray(row.metricAvailability)
     ? row.metricAvailability as Record<string, unknown> : {};
   const metricAvailability: Record<string, boolean> = {};
-  for (const key of availabilityKeys) metricAvailability[key] = rawAvailability[key] === true;
+  for (const key of availabilityKeys) metricAvailability[key] = key === 'probeFailure'
+    ? rawAvailability.probeFailure === true || (rawAvailability._methodVersion !== 'quality-v2' && rawAvailability.packetLoss === true)
+    : rawAvailability[key] === true;
+  const measurementMethodVersion = rawAvailability._methodVersion === 'quality-v2' ? 'quality-v2'
+    : rawAvailability._methodVersion === 'legacy-v1' ? 'legacy-v1'
+      : Object.hasOwn(rawAvailability, 'probeFailure') ? 'quality-v2' : 'legacy-v1';
+  const storedDownloadAt = typeof row.downloadMeasuredAt === 'string' && Number.isFinite(Date.parse(row.downloadMeasuredAt)) ? row.downloadMeasuredAt : undefined;
+  const storedUploadAt = typeof row.uploadMeasuredAt === 'string' && Number.isFinite(Date.parse(row.uploadMeasuredAt)) ? row.uploadMeasuredAt : undefined;
   const metric = (key: typeof availabilityKeys[number], value: unknown, min: number, max: number): number => {
     const parsed = numeric(value, min, max, !metricAvailability[key]);
     return parsed ?? 0; // Zero is an internal sentinel; details use availability to display N/A.
@@ -34,18 +41,22 @@ export function mapHistoricalRecord(row: Record<string, unknown>): LiveMeasureme
   const downloadMbps = metric('download', row.downloadMbps, 0, 100000);
   const uploadMbps = metric('upload', row.uploadMbps, 0, 100000);
   const jitterMs = metric('jitter', row.jitterMs, 0, 600000);
-  const packetLossPercent = metric('packetLoss', row.packetLossPercent, 0, 100);
+  const probeFailurePercent = metric('probeFailure', row.probeFailurePercent ?? row.packetLossPercent, 0, 100);
   const signalDbm = numeric(row.signalDbm, -200, 0, true);
   if (availabilityKeys.some((key) => rawAvailability[key] === true &&
-      numeric(({ latency: row.latencyMs, download: row.downloadMbps, upload: row.uploadMbps, jitter: row.jitterMs, packetLoss: row.packetLossPercent, signal: row.signalDbm })[key],
-        key === 'packetLoss' ? 0 : key === 'signal' ? -200 : 0,
-        key === 'packetLoss' ? 100 : key === 'signal' ? 0 : key === 'download' || key === 'upload' ? 100000 : 600000) === undefined)) return null;
+        numeric(({ latency: row.latencyMs, download: row.downloadMbps, upload: row.uploadMbps, jitter: row.jitterMs, probeFailure: row.probeFailurePercent ?? row.packetLossPercent, signal: row.signalDbm })[key],
+        key === 'probeFailure' ? 0 : key === 'signal' ? -200 : 0,
+        key === 'probeFailure' ? 100 : key === 'signal' ? 0 : key === 'download' || key === 'upload' ? 100000 : 600000) === undefined)) return null;
 
+  const hasScorableMetric = ['latency', 'download', 'probeFailure', 'jitter'].some((key) => metricAvailability[key] === true);
   return {
     id: String(row.id ?? `${latitude},${longitude},${timestamp.toISOString()}`), latitude, longitude, accuracy,
     timestamp: timestamp.toISOString(), operator: row.operator as TelecomOperator,
-    latencyMs, downloadMbps, uploadMbps, jitterMs, packetLossPercent, nqs,
-    status: row.status === 'NO_CONNECTIVITY' ? 'NO_CONNECTIVITY' : nqs >= 80 ? 'EXCELLENT' : nqs >= 60 ? 'GOOD' : nqs >= 40 ? 'MODERATE' : 'POOR',
+    latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs,
+    downloadMeasuredAt: storedDownloadAt ?? (measurementMethodVersion === 'quality-v2' ? timestamp.toISOString() : undefined),
+    uploadMeasuredAt: storedUploadAt ?? (measurementMethodVersion === 'quality-v2' ? timestamp.toISOString() : undefined),
+    status: row.status === 'NO_CONNECTIVITY' ? 'NO_CONNECTIVITY' : !hasScorableMetric ? 'UNAVAILABLE' : nqs >= 80 ? 'EXCELLENT' : nqs >= 60 ? 'GOOD' : nqs >= 40 ? 'MODERATE' : 'POOR',
+    measurementMethodVersion,
     signalDbm: metricAvailability.signal ? signalDbm : undefined,
     signalStatus: metricAvailability.signal && signalDbm !== undefined ? 'AVAILABLE' : 'UNAVAILABLE',
     metricAvailability
@@ -80,7 +91,7 @@ export function groupExactLocations(rows: LiveMeasurement[]): LiveMeasurement[][
 
 const NQS_RECENCY_HALF_LIFE_MS = 30 * 86_400_000;
 export function recencyWeightedGroupNqs(group: LiveMeasurement[], now = Date.now()): number | null {
-  const scored = group.filter((row) => row.status !== 'NO_CONNECTIVITY' && Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100);
+  const scored = group.filter((row) => row.status !== 'NO_CONNECTIVITY' && row.status !== 'UNAVAILABLE' && row.measurementMethodVersion !== 'legacy-v1' && Number.isFinite(row.nqs) && row.nqs >= 0 && row.nqs <= 100);
   if (!scored.length) return null;
   const weights = scored.map((row) => Math.pow(0.5, Math.max(0, now - Date.parse(row.timestamp)) / NQS_RECENCY_HALF_LIFE_MS));
   const weightSum = weights.reduce((sum, weight) => sum + weight, 0);
@@ -105,10 +116,11 @@ export function historicalDetailHtml(rows: LiveMeasurement[]): string {
     const available = row.metricAvailability ?? {};
     const metric = (key: string, value: number | undefined, suffix: string) => formatHistoricalMetric(value, available[key] === true, suffix);
     return `<section style="padding:6px 0;border-bottom:1px solid #ccd">` +
+      `${row.measurementMethodVersion === 'legacy-v1' ? '<div><strong>Legacy measurement method:</strong> this score and sample cadence are not comparable with corrected readings.</div>' : ''}` +
       `<strong>${esc(row.operator)} · ${esc(new Date(row.timestamp).toLocaleString())}</strong>` +
       `<div>NQS: ${row.nqs}/100</div><div>Latency: ${metric('latency', row.latencyMs, 'ms')}</div>` +
       `<div>Download: ${metric('download', row.downloadMbps, 'Mbps')}</div><div>Upload: ${metric('upload', row.uploadMbps, 'Mbps')}</div>` +
-      `<div>Jitter: ${metric('jitter', row.jitterMs, 'ms')}</div><div>Probe failure: ${metric('packetLoss', row.packetLossPercent, '%')}</div>` +
+      `<div>Jitter: ${metric('jitter', row.jitterMs, 'ms')}</div><div>Probe failure: ${metric('probeFailure', row.probeFailurePercent, '%')}</div>` +
       `<div>GPS accuracy: ${esc(String(row.accuracy))} m</div><div>Signal: ${available.signal === true && row.signalDbm !== undefined ? `${row.signalDbm} dBm (available)` : 'N/A (unavailable)'}</div>` +
       `</section>`;
   }).join('')}</div>`;

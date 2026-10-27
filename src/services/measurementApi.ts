@@ -2,12 +2,13 @@ import type { LiveMeasurement, TelecomOperator } from '../types';
 import { mapHistoricalRecord, mapHistoricalRecords } from './historicalMeasurements';
 import { fetchAllMeasurementPages } from './measurementPagination';
 import { selectLatestPersistedMeasurement } from './measurementTelemetry';
+import { resolveMeasurementServerUrl } from './networkMeasurer';
 
 function getApiBase(): string {
-  const configured = import.meta.env.VITE_MEASUREMENT_SERVER_URL;
-  if (configured) return configured.replace(/\/$/, '');
-  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') return `http://${window.location.hostname}:3001`;
-  return 'http://localhost:3001';
+  const base = resolveMeasurementServerUrl(import.meta.env.VITE_MEASUREMENT_SERVER_URL, import.meta.env.PROD,
+    typeof window !== 'undefined' ? window.location.hostname : undefined);
+  if (!base) throw new Error('Measurement API URL is not configured. Set VITE_MEASUREMENT_SERVER_URL to the HTTPS Render service URL and rebuild.');
+  return base;
 }
 
 function diagnosticEndpoint(path: string): string {

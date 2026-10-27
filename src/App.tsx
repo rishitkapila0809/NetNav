@@ -22,6 +22,7 @@ import { calculateRouteRankings } from './services/routeRanking';
 import { advanceOffRouteFixCount, calculateRouteProgress, canRequestReroute, endNavigationSession, isGpsJump, startNavigationSession, validateNavigationFix, type NavigationGpsFix, type RouteProgress } from './services/liveNavigation';
 import { findNearbyMeasurements, type MapSearchResult } from './services/mapLocationSearch';
 import { selectTelemetryMeasurement } from './services/measurementTelemetry';
+import { measurementGpsMessage, shouldPersistMeasurement, validateMeasurementGps } from './services/measurementValidation';
 import type { RoutePickMode } from './components/RoutePlannerPanel';
 
 // Helper function to calculate geographic distance in meters between 2 coordinates (Haversine formula)
@@ -520,9 +521,14 @@ export function App() {
   // Start Live Measurement Session
   const handleStartMeasuring = () => {
     if (isMeasuring) return;
+    if (!networkMeasurer.getConfig().serverUrl) {
+      showToast('Measurement server is not configured. Set VITE_MEASUREMENT_SERVER_URL to the HTTPS Render URL and rebuild the frontend.');
+      return;
+    }
     const gps = userGpsRef.current;
-    if (!gps || Date.now() - gps.timestamp > 30_000) {
-      showToast('Waiting for a current GPS fix. Allow location access or use the map’s retry control before measuring.');
+    const gpsStatus = validateMeasurementGps(gps);
+    if (gpsStatus !== 'ready') {
+      showToast(`${measurementGpsMessage(gpsStatus)} Allow location access or use the map’s retry control.`);
       return;
     }
 
@@ -565,8 +571,9 @@ export function App() {
 
       try {
         const currentGps = userGpsRef.current;
-        if (!currentGps || Date.now() - currentGps.timestamp > 30_000) {
-          showToast('GPS fix expired. Measurement paused until a fresh location is available.');
+        const gpsStatus = validateMeasurementGps(currentGps);
+        if (gpsStatus !== 'ready' || !currentGps) {
+          showToast(`${measurementGpsMessage(gpsStatus)} Measurement stopped to avoid saving an uncertain location.`);
           handleStopMeasuring();
           return;
         }
@@ -582,6 +589,12 @@ export function App() {
           controller.signal
         );
 
+        if (validateMeasurementGps(userGpsRef.current) !== 'ready') {
+          showToast('GPS became stale or too inaccurate during the measurement. The sample was discarded to avoid attaching it to an uncertain location.');
+          handleStopMeasuring();
+          return;
+        }
+
         // Discard sample if user clicked Stop while awaiting measurement
         if (!isMeasuringRef.current || controller.signal.aborted) {
           return;
@@ -589,7 +602,7 @@ export function App() {
 
         setCurrentMeasurement(sample);
         setLiveMeasurements((prev) => [...prev, sample]);
-        if (!sample.isOffline) {
+        if (shouldPersistMeasurement(sample)) {
           try {
             await saveMeasurement(sample);
             routeHistoryCacheRef.current.delete(sample.operator);
@@ -645,7 +658,7 @@ export function App() {
 
       if (all.length > 0) {
         // Exclude NO_CONNECTIVITY/offline observations from Best/Worst spot calculations
-        const validSamples = all.filter((m) => m.status !== 'NO_CONNECTIVITY' && !m.isOffline);
+        const validSamples = all.filter((m) => m.status !== 'NO_CONNECTIVITY' && m.status !== 'UNAVAILABLE' && !m.isOffline && m.measurementMethodVersion !== 'legacy-v1');
 
         const bestSpot = validSamples.length > 0
           ? validSamples.reduce((max, cur) => (cur.nqs > max.nqs ? cur : max), validSamples[0])

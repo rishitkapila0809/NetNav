@@ -54,31 +54,48 @@ function metricScore(value, low, high) {
   return Math.round(100 - ((value - low) / (high - low)) * 100);
 }
 function throughputScore(value) { return Math.max(0, Math.min(100, Math.round(value))); }
-function packetLossScore(value) { return value <= 0 ? 100 : value >= 20 ? 0 : Math.round(100 - value * 5); }
+function probeFailureScore(value) { return value <= 0 ? 100 : value >= 20 ? 0 : Math.round(100 - value * 5); }
 function jitterScore(value) { return metricScore(value, 2, 50); }
 export function validateMeasurement(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Measurement must be an object');
-  const { id, operator, latitude, longitude, accuracy, timestamp, latencyMs, downloadMbps, uploadMbps, jitterMs, packetLossPercent, signalDbm, signalStatus, metricAvailability } = input;
+  const { id, operator, latitude, longitude, accuracy, timestamp, latencyMs, downloadMbps, uploadMbps, jitterMs, signalDbm, signalStatus, metricAvailability } = input;
+  // `packetLossPercent` / availability.packetLoss are accepted only for old clients and rows.
+  const probeFailurePercent = input.probeFailurePercent ?? input.packetLossPercent;
   if (!OPERATORS.has(operator)) throw new Error('Invalid operator');
   const number = (name, value, min, max) => {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`Invalid ${name}`);
   };
-  number('latitude', latitude, -90, 90); number('longitude', longitude, -180, 180); number('accuracy', accuracy, 0, 10000);
+  number('latitude', latitude, -90, 90); number('longitude', longitude, -180, 180); number('accuracy', accuracy, 0, 10);
   number('latencyMs', latencyMs, 0, 600000); number('downloadMbps', downloadMbps, 0, 100000); number('uploadMbps', uploadMbps, 0, 100000);
-  number('jitterMs', jitterMs, 0, 600000); number('packetLossPercent', packetLossPercent, 0, 100);
-  if (typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp))) throw new Error('Invalid timestamp');
+  number('jitterMs', jitterMs, 0, 600000); number('probeFailurePercent', probeFailurePercent, 0, 100);
+  if (typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp)) || Date.parse(timestamp) > Date.now() + 300_000) throw new Error('Invalid or future timestamp');
   if (id !== undefined && (typeof id !== 'string' || id.length > 100)) throw new Error('Invalid id');
   if (signalDbm !== undefined && signalDbm !== null) number('signalDbm', signalDbm, -200, 0);
   if (!['AVAILABLE', 'UNAVAILABLE'].includes(signalStatus)) throw new Error('Invalid signalStatus');
-  const availability = metricAvailability && typeof metricAvailability === 'object' && !Array.isArray(metricAvailability)
-    ? metricAvailability : { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: signalStatus === 'AVAILABLE' };
-  for (const key of Object.keys(availability)) if (typeof availability[key] !== 'boolean') throw new Error(`Invalid availability metadata: ${key}`);
-  const scores = { latency: availability.latency === false ? null : metricScore(latencyMs, 15, 300), throughput: availability.download === false ? null : throughputScore(downloadMbps), packetLoss: availability.packetLoss === false ? null : packetLossScore(packetLossPercent), jitter: availability.jitter === false ? null : jitterScore(jitterMs) };
-  const weights = { latency: 0.25, throughput: 0.30, packetLoss: 0.20, jitter: 0.10 };
+  const rawAvailability = metricAvailability && typeof metricAvailability === 'object' && !Array.isArray(metricAvailability) ? metricAvailability : null;
+  const readAvailability = (key, legacyKey, fallback) => {
+    const value = rawAvailability?.[key] ?? (legacyKey ? rawAvailability?.[legacyKey] : undefined);
+    if (value === undefined) return fallback;
+    if (typeof value !== 'boolean') throw new Error(`Invalid availability metadata: ${key}`);
+    return value;
+  };
+  if (rawAvailability) {
+    const validKeys = new Set(['latency', 'download', 'upload', 'jitter', 'probeFailure', 'packetLoss', 'signal']);
+    for (const key of Object.keys(rawAvailability)) if (!validKeys.has(key)) throw new Error(`Invalid availability metadata: ${key}`);
+  }
+  const availability = {
+    latency: readAvailability('latency', null, true), download: readAvailability('download', null, true),
+    upload: readAvailability('upload', null, true), jitter: readAvailability('jitter', null, true),
+    probeFailure: readAvailability('probeFailure', 'packetLoss', true), signal: readAvailability('signal', null, signalStatus === 'AVAILABLE')
+  };
+  const measurementMethodVersion = input.measurementMethodVersion === 'quality-v2' ? 'quality-v2' : 'legacy-v1';
+  const scores = { latency: availability.latency === false ? null : metricScore(latencyMs, 15, 300), throughput: availability.download === false ? null : throughputScore(downloadMbps), probeFailure: availability.probeFailure === false ? null : probeFailureScore(probeFailurePercent), jitter: availability.jitter === false ? null : jitterScore(jitterMs) };
+  const weights = { latency: 0.25, throughput: 0.30, probeFailure: 0.20, jitter: 0.10 };
   const included = Object.entries(scores).filter(([, score]) => score !== null);
   const weightSum = included.reduce((sum, [name]) => sum + weights[name], 0);
-  const nqs = weightSum === 0 ? 0 : Math.max(0, Math.min(100, Math.round(included.reduce((sum, [name, score]) => sum + weights[name] * score, 0) / weightSum)));
-  return { id: id || randomUUID(), operator, latitude, longitude, accuracy, timestamp: new Date(timestamp).toISOString(), latencyMs, downloadMbps, uploadMbps, jitterMs, packetLossPercent, nqs, signalDbm: signalDbm ?? null, signalStatus, metricAvailability: availability };
+  if (weightSum === 0) throw new Error('Cannot save a measurement without a valid NQS component');
+  const nqs = Math.max(0, Math.min(100, Math.round(included.reduce((sum, [name, score]) => sum + weights[name] * score, 0) / weightSum)));
+  return { id: id || randomUUID(), operator, latitude, longitude, accuracy, timestamp: new Date(timestamp).toISOString(), latencyMs, downloadMbps, uploadMbps, jitterMs, probeFailurePercent, nqs, signalDbm: signalDbm ?? null, signalStatus, metricAvailability: availability, measurementMethodVersion };
 }
 function requirePool() {
   try { return getPool(); }
@@ -87,7 +104,7 @@ function requirePool() {
 export async function saveMeasurement(input, db = requirePool()) {
   const m = validateMeasurement(input);
   try {
-    const { rows } = await db.query(`INSERT INTO network_measurements (id, operator, latitude, longitude, accuracy_m, measured_at, latency_ms, download_mbps, upload_mbps, jitter_ms, probe_failure_percent, nqs, signal_dbm, metric_availability) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`, [m.id,m.operator,m.latitude,m.longitude,m.accuracy,m.timestamp,m.latencyMs,m.downloadMbps,m.uploadMbps,m.jitterMs,m.packetLossPercent,m.nqs,m.signalDbm,JSON.stringify(m.metricAvailability)]);
+    const { rows } = await db.query(`INSERT INTO network_measurements (id, operator, latitude, longitude, accuracy_m, measured_at, latency_ms, download_mbps, upload_mbps, jitter_ms, probe_failure_percent, nqs, signal_dbm, metric_availability) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`, [m.id,m.operator,m.latitude,m.longitude,m.accuracy,m.timestamp,m.latencyMs,m.downloadMbps,m.uploadMbps,m.jitterMs,m.probeFailurePercent,m.nqs,m.signalDbm,JSON.stringify({ ...m.metricAvailability, _methodVersion: m.measurementMethodVersion })]);
     if (!rows[0]) throw new Error('Insert returned no measurement row');
     return rows[0];
   } catch (error) {
@@ -107,7 +124,7 @@ export async function listMeasurements({ operator, limit = 100, before, beforeId
     where.push(`(measured_at, id) < ($${values.length - 1}::timestamptz, $${values.length}::text)`);
   } else if (before) { values.push(new Date(before).toISOString()); where.push(`measured_at < $${values.length}`); }
   values.push(limit);
-  const { rows } = await db.query(`SELECT id, operator, latitude, longitude, accuracy_m AS accuracy, measured_at AS timestamp, latency_ms AS "latencyMs", download_mbps AS "downloadMbps", upload_mbps AS "uploadMbps", jitter_ms AS "jitterMs", probe_failure_percent AS "packetLossPercent", nqs, signal_dbm AS "signalDbm", CASE WHEN signal_dbm IS NULL THEN 'UNAVAILABLE' ELSE 'AVAILABLE' END AS "signalStatus", metric_availability AS "metricAvailability" FROM network_measurements ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY measured_at DESC, id DESC LIMIT $${values.length}`, values);
+  const { rows } = await db.query(`SELECT id, operator, latitude, longitude, accuracy_m AS accuracy, measured_at AS timestamp, latency_ms AS "latencyMs", download_mbps AS "downloadMbps", upload_mbps AS "uploadMbps", jitter_ms AS "jitterMs", probe_failure_percent AS "probeFailurePercent", nqs, signal_dbm AS "signalDbm", CASE WHEN signal_dbm IS NULL THEN 'UNAVAILABLE' ELSE 'AVAILABLE' END AS "signalStatus", metric_availability AS "metricAvailability" FROM network_measurements ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY measured_at DESC, id DESC LIMIT $${values.length}`, values);
   return rows;
 }
 

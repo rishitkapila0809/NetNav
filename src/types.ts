@@ -1,12 +1,13 @@
 export type TelecomOperator = 'Jio' | 'Airtel' | 'Vi' | 'BSNL';
 
-export type NetworkStatus = 'EXCELLENT' | 'GOOD' | 'MODERATE' | 'POOR' | 'NO_CONNECTIVITY';
+export type NetworkStatus = 'EXCELLENT' | 'GOOD' | 'MODERATE' | 'POOR' | 'NO_CONNECTIVITY' | 'UNAVAILABLE';
+export type MeasurementMethodVersion = 'legacy-v1' | 'quality-v2';
 
 export interface NetworkMetrics {
   nqs: number;
   status: NetworkStatus;
   latencyMs: number;
-  packetLossPercent: number;
+  probeFailurePercent: number;
   throughputMbps: number;
   jitterMs: number;
   signalDbm?: number;
@@ -59,7 +60,7 @@ export interface LiveMeasurement {
   timestamp: string;
   latencyMs: number;
   jitterMs: number;
-  packetLossPercent: number;
+  probeFailurePercent: number;
   downloadMbps: number;
   uploadMbps: number;
   signalDbm?: number;
@@ -67,10 +68,17 @@ export interface LiveMeasurement {
   nqs: number;
   status: NetworkStatus;
   operator: TelecomOperator;
+  /** Indicates whether this row uses the corrected probe window and persistence cadence. */
+  measurementMethodVersion?: MeasurementMethodVersion;
+  /** True only for the sample cycle that actually attempted active download/upload tests. */
+  throughputTestPerformed?: boolean;
+  /** Time of the most recent successful throughput test; historical rows default to timestamp. */
+  downloadMeasuredAt?: string;
+  uploadMeasuredAt?: string;
   isOffline?: boolean;
   metricAvailability?: Record<string, boolean>;
   offlineReason?: 'MEASUREMENT_SERVER_UNREACHABLE';
-  nqsComponents?: { latency: number | null; throughput: number | null; packetLoss: number | null; jitter: number | null; raw: number };
+  nqsComponents?: { latency: number | null; throughput: number | null; probeFailure: number | null; jitter: number | null; raw: number | null };
 }
 
 export interface RouteSegment {

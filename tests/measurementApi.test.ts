@@ -5,7 +5,7 @@ import { createMeasurementServer, parseAllowedOrigins, validateMeasurement, save
 const valid = {
   id: 'sample-1', operator: 'Jio', latitude: 12.9692, longitude: 79.1559, accuracy: 8,
   timestamp: '2026-10-25T10:00:00.000Z', latencyMs: 30, downloadMbps: 50, uploadMbps: 12,
-  jitterMs: 5, packetLossPercent: 0, signalStatus: 'UNAVAILABLE'
+  jitterMs: 5, probeFailurePercent: 0, signalStatus: 'UNAVAILABLE', measurementMethodVersion: 'quality-v2'
 };
 
 describe('Measurement API validation and persistence contract', () => {
@@ -64,13 +64,27 @@ describe('Measurement API validation and persistence contract', () => {
     assert.equal(result.metricAvailability.signal, false);
   });
 
+  test('accepts legacy packetLoss payloads but stores them as HTTP probe failures with a legacy version', () => {
+    const oldClient = validateMeasurement({ ...valid, measurementMethodVersion: 'legacy-v1', probeFailurePercent: undefined,
+      packetLossPercent: 10, metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false } });
+    assert.equal(oldClient.probeFailurePercent, 10);
+    assert.equal(oldClient.metricAvailability.probeFailure, true);
+    assert.equal(oldClient.metricAvailability.packetLoss, undefined);
+    assert.equal(oldClient.measurementMethodVersion, 'legacy-v1');
+  });
+
   test('rejects invalid operator, coordinates, numeric ranges, timestamps and metadata', () => {
     for (const value of [
       { ...valid, operator: 'Other' }, { ...valid, latitude: 91 }, { ...valid, longitude: Infinity },
-      { ...valid, accuracy: -1 }, { ...valid, latencyMs: -1 }, { ...valid, downloadMbps: NaN },
-      { ...valid, packetLossPercent: 101 }, { ...valid, timestamp: 'not a date' },
+      { ...valid, accuracy: -1 }, { ...valid, accuracy: 10.1 }, { ...valid, latencyMs: -1 }, { ...valid, downloadMbps: NaN },
+      { ...valid, probeFailurePercent: 101 }, { ...valid, timestamp: 'not a date' },
+      { ...valid, timestamp: '2999-01-01T00:00:00.000Z' },
       { ...valid, metricAvailability: { signal: 'no' } }
     ]) assert.throws(() => validateMeasurement(value));
+  });
+
+  test('refuses to persist an NQS when every score component is unavailable', () => {
+    assert.throws(() => validateMeasurement({ ...valid, metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } }), /without a valid NQS component/);
   });
 
   test('uses parameterized SQL for insert and bounded filtered retrieval', async () => {
@@ -85,6 +99,7 @@ describe('Measurement API validation and persistence contract', () => {
     assert.equal(calls[1].values.at(-1), 20);
     assert.match(calls[2].sql, /\(measured_at, id\) < \(\$2::timestamptz, \$3::text\)/);
     assert.deepEqual(calls[2].values, ['Jio', '2026-10-25T10:00:00.000Z', 'sample-1', 20]);
+    assert.deepEqual(JSON.parse(String(calls[0].values[13])), { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: false, _methodVersion: 'quality-v2' });
     await assert.rejects(listMeasurements({ beforeId: 'sample-1' }, db), /Invalid before cursor/);
   });
 
@@ -92,7 +107,7 @@ describe('Measurement API validation and persistence contract', () => {
     let rows: Record<string, unknown>[] = [];
     const db = { async query(sql: string, values: unknown[] = []) {
       if (sql.startsWith('INSERT')) {
-        const row = { id: values[0], operator: values[1], latitude: values[2], longitude: values[3], accuracy: values[4], timestamp: values[5], latencyMs: values[6], downloadMbps: values[7], uploadMbps: values[8], jitterMs: values[9], packetLossPercent: values[10], nqs: values[11], signalDbm: values[12], signalStatus: 'UNAVAILABLE', metricAvailability: JSON.parse(String(values[13])) };
+        const row = { id: values[0], operator: values[1], latitude: values[2], longitude: values[3], accuracy: values[4], timestamp: values[5], latencyMs: values[6], downloadMbps: values[7], uploadMbps: values[8], jitterMs: values[9], probeFailurePercent: values[10], nqs: values[11], signalDbm: values[12], signalStatus: 'UNAVAILABLE', metricAvailability: JSON.parse(String(values[13])) };
         rows.push(row); return { rows: [row] };
       }
       if (sql.startsWith('SELECT')) return { rows };

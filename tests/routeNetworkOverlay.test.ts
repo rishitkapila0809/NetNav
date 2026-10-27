@@ -10,7 +10,7 @@ const end: RouteCoordinate = { lat: 12.9692, lng: 79.157 };
 const path = [start, end];
 function row(id: string, longitude: number, overrides: Partial<LiveMeasurement> = {}): LiveMeasurement {
   return { id, latitude: start.lat, longitude, accuracy: 5, timestamp: new Date(now - 60_000).toISOString(),
-    operator: 'Jio', latencyMs: 20, downloadMbps: 40, uploadMbps: 8, jitterMs: 3, packetLossPercent: 1,
+    operator: 'Jio', latencyMs: 20, downloadMbps: 40, uploadMbps: 8, jitterMs: 3, probeFailurePercent: 1,
     signalStatus: 'UNAVAILABLE', nqs: 85, status: 'EXCELLENT', metricAvailability: {}, ...overrides };
 }
 const nearFirstBin = start.lng + 0.0001;

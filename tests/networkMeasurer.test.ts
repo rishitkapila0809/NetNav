@@ -1,7 +1,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
 import http from 'node:http';
-import { createMeasurementServer } from '../server/index.js';
+import { createMeasurementServer, validateMeasurement } from '../server/index.js';
 import { NetworkMeasurerService } from '../src/services/networkMeasurer.ts';
 
 describe('Network Measurer Service with Real Server Tests', () => {
@@ -62,7 +62,9 @@ describe('Network Measurer Service with Real Server Tests', () => {
     assert.strictEqual(sample.operator, 'Jio');
     assert.strictEqual(sample.signalStatus, 'UNAVAILABLE');
     assert.strictEqual(sample.signalDbm, undefined);
-    assert.ok(sample.nqs > 0 && sample.nqs <= 100, `NQS should be in range 1-100, got ${sample.nqs}`);
+    assert.equal(sample.measurementMethodVersion, 'quality-v2');
+    assert.equal(sample.throughputTestPerformed, true);
+    assert.ok(sample.nqs >= 0 && sample.nqs <= 100, `NQS should be in range 0-100, got ${sample.nqs}`);
     assert.ok(['EXCELLENT', 'GOOD', 'MODERATE', 'POOR'].includes(sample.status));
     assert.ok(sample.downloadMbps > 0, 'Download throughput should be positive');
     assert.ok(sample.uploadMbps > 0, 'Upload throughput should be positive');
@@ -81,7 +83,9 @@ describe('Network Measurer Service with Real Server Tests', () => {
     assert.strictEqual(probe.latencyMs, 0);
 
     const sample1 = await badMeasurer.measureSample(12.9692, 79.1559, 10, 'Airtel');
-    assert.strictEqual(sample1.packetLossPercent, 100);
+    assert.strictEqual(sample1.probeFailurePercent, 100);
+    assert.equal(sample1.metricAvailability?.probeFailure, false, 'the one-sample startup window is not a stable failure rate');
+    assert.equal(sample1.status, 'UNAVAILABLE');
   });
 
   test('3 consecutive probe failures triggers NO_CONNECTIVITY offline classification', async () => {
@@ -104,15 +108,15 @@ describe('Network Measurer Service with Real Server Tests', () => {
     assert.strictEqual(s3.status, 'NO_CONNECTIVITY');
     assert.strictEqual(s3.nqs, 0);
     assert.strictEqual(s3.offlineReason, 'MEASUREMENT_SERVER_UNREACHABLE');
-    assert.strictEqual(s3.packetLossPercent, 100);
+    assert.strictEqual(s3.probeFailurePercent, 100);
     assert.equal(s3.metricAvailability?.latency, false);
     assert.equal(s3.metricAvailability?.jitter, false);
   });
 
   test('NQS excludes missing metrics and renormalizes over the remaining measured weights', () => {
-    const result = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, packetLossPercent: 0, jitterMs: 0,
-      availability: { latency: true, download: true, packetLoss: true, jitter: false } });
-    assert.deepStrictEqual(result.scores, { latency: 100, throughput: 100, packetLoss: 100, jitter: null });
+    const result = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 0,
+      availability: { latency: true, download: true, probeFailure: true, jitter: false } });
+    assert.deepStrictEqual(result.scores, { latency: 100, throughput: 100, probeFailure: 100, jitter: null });
     assert.equal(result.raw, 100);
     assert.equal(result.nqs, 100);
   });
@@ -122,19 +126,55 @@ describe('Network Measurer Service with Real Server Tests', () => {
     assert.equal(measurer.calcThroughputScore(1000), 100);
     assert.equal(measurer.calcLatencyScore(300), 0);
     assert.equal(measurer.calcLatencyScore(15), 100);
-    const result = measurer.calculateNqs({ latencyMs: 600, downloadMbps: 1, packetLossPercent: 20, jitterMs: 100,
-      availability: { latency: true, download: true, packetLoss: true, jitter: true } });
-    assert.deepStrictEqual(result.scores, { latency: 0, throughput: 1, packetLoss: 0, jitter: 0 });
+    const result = measurer.calculateNqs({ latencyMs: 600, downloadMbps: 1, probeFailurePercent: 20, jitterMs: 100,
+      availability: { latency: true, download: true, probeFailure: true, jitter: true } });
+    assert.deepStrictEqual(result.scores, { latency: 0, throughput: 1, probeFailure: 0, jitter: 0 });
     assert.ok(result.nqs < 1);
   });
 
+  test('controlled excellent, moderate, mixed, and poor cases preserve the locked formula', () => {
+    const cases = [
+      { name: 'excellent', input: { latencyMs: 10, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 1 }, scores: [100, 100, 100, 100], raw: 100, final: 100 },
+      { name: 'moderate', input: { latencyMs: 100, downloadMbps: 50, probeFailurePercent: 10, jitterMs: 20 }, scores: [70, 50, 50, 63], raw: 57.411764705882355, final: 57 },
+      { name: 'mixed', input: { latencyMs: 30, downloadMbps: 5, probeFailurePercent: 10, jitterMs: 20 }, scores: [95, 5, 50, 63], raw: 48.88235294117647, final: 49 },
+      { name: 'poor', input: { latencyMs: 500, downloadMbps: 0, probeFailurePercent: 25, jitterMs: 60 }, scores: [0, 0, 0, 0], raw: 0, final: 0 }
+    ];
+    for (const row of cases) {
+      const result = measurer.calculateNqs({ ...row.input, availability: { latency: true, download: true, probeFailure: true, jitter: true } });
+      assert.deepEqual([result.scores.latency, result.scores.throughput, result.scores.probeFailure, result.scores.jitter], row.scores, row.name);
+      assert.equal(result.available, true);
+      assert.ok(result.raw !== null && Math.abs(result.raw - row.raw) < 1e-12, `${row.name}: raw score ${result.raw}`);
+      assert.equal(result.nqs, row.final);
+      const serverRow = validateMeasurement({
+        id: `controlled-${row.name}`, operator: 'Jio', latitude: 12.9, longitude: 79.1, accuracy: 5,
+        timestamp: new Date().toISOString(), ...row.input, uploadMbps: 10, signalStatus: 'UNAVAILABLE',
+        measurementMethodVersion: 'quality-v2',
+        metricAvailability: { latency: true, download: true, upload: true, probeFailure: true, jitter: true, signal: false }
+      });
+      assert.equal(serverRow.nqs, result.nqs, `client/server formula parity for ${row.name}`);
+    }
+  });
+
+  test('invalid metric values are excluded and no available component is an unavailable score', () => {
+    const result = measurer.calculateNqs({ latencyMs: Number.NaN, downloadMbps: -1, probeFailurePercent: 2, jitterMs: 1,
+      availability: { latency: true, download: true, probeFailure: false, jitter: true } });
+    assert.deepEqual(result.scores, { latency: null, throughput: null, probeFailure: null, jitter: 100 });
+    assert.equal(result.available, true);
+    assert.equal(result.nqs, 100);
+    const empty = measurer.calculateNqs({ latencyMs: 0, downloadMbps: 0, probeFailurePercent: 0, jitterMs: 0,
+      availability: { latency: false, download: false, probeFailure: false, jitter: false } });
+    assert.equal(empty.available, false);
+    assert.equal(empty.nqs, 0, '0 is only an internal sentinel when available=false');
+    assert.equal(measurer.getNqsStatus(null), 'UNAVAILABLE');
+  });
+
   test('genuinely excellent available measurements produce 100; integer rounding can also reach 100 below the ceiling', () => {
-    const excellent = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, packetLossPercent: 0, jitterMs: 2,
-      availability: { latency: true, download: true, packetLoss: true, jitter: true } });
+    const excellent = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 2,
+      availability: { latency: true, download: true, probeFailure: true, jitter: true } });
     assert.equal(excellent.raw, 100);
     assert.equal(excellent.nqs, 100);
-    const rounded = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, packetLossPercent: 0, jitterMs: 3,
-      availability: { latency: true, download: true, packetLoss: true, jitter: true } });
+    const rounded = measurer.calculateNqs({ latencyMs: 15, downloadMbps: 100, probeFailurePercent: 0, jitterMs: 3,
+      availability: { latency: true, download: true, probeFailure: true, jitter: true } });
     assert.ok(rounded.raw < 100 && rounded.raw >= 99.5);
     assert.equal(rounded.nqs, 100);
   });
@@ -175,7 +215,7 @@ describe('Network Measurer Service with Real Server Tests', () => {
       assert.equal(first.isOffline, false);
       assert.equal(second.isOffline, false);
       assert.equal(third.isOffline, true);
-      assert.equal(third.packetLossPercent, 100);
+      assert.equal(third.probeFailurePercent, 100);
       const recovered = await recovery.measureSample(12.9, 79.1, 10, 'Vi');
       assert.equal(recovered.isOffline, false);
       assert.equal(recovered.metricAvailability?.latency, true);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { LiveMeasurement } from '../src/types.ts';
 import { findNearbyMeasurements, locationSearchStateMessage, MAP_SEARCH_MEASUREMENT_RADIUS_METERS, searchMapLocationsWith } from '../src/services/mapLocationSearch.ts';
 
-const base: LiveMeasurement = { id: 'near', operator: 'Jio', latitude: 12.9692, longitude: 79.1559, accuracy: 5, timestamp: '2026-10-26T10:00:00Z', latencyMs: 10, downloadMbps: 20, uploadMbps: 5, jitterMs: 2, packetLossPercent: 0, signalStatus: 'UNAVAILABLE', nqs: 82, status: 'EXCELLENT', metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false } };
+const base: LiveMeasurement = { id: 'near', operator: 'Jio', latitude: 12.9692, longitude: 79.1559, accuracy: 5, timestamp: '2026-10-26T10:00:00Z', latencyMs: 10, downloadMbps: 20, uploadMbps: 5, jitterMs: 2, probeFailurePercent: 0, signalStatus: 'UNAVAILABLE', nqs: 82, status: 'EXCELLENT', metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: false } };
 
 describe('campus and address map search', () => {
   test('maps selectable geocoder results to actual returned coordinates', async () => {

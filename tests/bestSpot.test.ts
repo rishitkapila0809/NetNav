@@ -8,9 +8,9 @@ const gps: BestSpotGps = { lat: 12.9692, lng: 79.1559, accuracy: 3, timestamp: n
 function row(id: string, options: Partial<LiveMeasurement> = {}): LiveMeasurement {
   return {
     id, latitude: gps.lat, longitude: gps.lng, accuracy: 4, timestamp: new Date(now - 60_000).toISOString(),
-    operator: 'Jio', latencyMs: 20, downloadMbps: 50, uploadMbps: 10, jitterMs: 3, packetLossPercent: 1,
+    operator: 'Jio', latencyMs: 20, downloadMbps: 50, uploadMbps: 10, jitterMs: 3, probeFailurePercent: 1,
     signalDbm: undefined, signalStatus: 'UNAVAILABLE', nqs: 80, status: 'EXCELLENT',
-    metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false },
+    metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: false },
     ...options
   };
 }
@@ -35,6 +35,13 @@ describe('Find Best Spot persisted measurement search', () => {
     const result = findBestSpot([row('jio'), row('airtel', { operator: 'Airtel' })], 'Airtel', gps, now);
     assert.equal(result.status, 'success');
     if (result.status === 'success') assert.equal(result.candidate.operator, 'Airtel');
+  });
+
+  test('does not rank legacy sampling or historical fixes with more than ten-metre accuracy', () => {
+    const legacy = row('legacy', { measurementMethodVersion: 'legacy-v1' });
+    const inaccurate = row('inaccurate', { accuracy: 10.1 });
+    assert.equal(findBestSpot([legacy, inaccurate], 'Jio', gps, now).status, 'no-data');
+    assert.equal(findBestSpot([row('eligible', { accuracy: 10 })], 'Jio', gps, now).status, 'success');
   });
 
   test('groups repeated readings within five metres into one candidate spot', () => {
@@ -81,8 +88,8 @@ describe('Find Best Spot persisted measurement search', () => {
   });
 
   test('missing and unavailable metrics remain unavailable instead of becoming zero', () => {
-    const result = findBestSpot([row('no-metrics', { latencyMs: 0, downloadMbps: 0, uploadMbps: 0, jitterMs: 0, packetLossPercent: 0,
-      metricAvailability: { latency: false, download: false, upload: false, jitter: false, packetLoss: false, signal: false } })], 'Jio', gps, now);
+    const result = findBestSpot([row('no-metrics', { latencyMs: 0, downloadMbps: 0, uploadMbps: 0, jitterMs: 0, probeFailurePercent: 0,
+      metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } })], 'Jio', gps, now);
     assert.equal(result.status, 'success');
     if (result.status === 'success') {
       assert.equal(result.candidate.metrics.latencyMs, undefined);

@@ -9,8 +9,8 @@ import type { LiveMeasurement } from '../src/types.ts';
 const base = {
   id: 'db-row-17', operator: 'Airtel', latitude: 12.9692, longitude: 79.1559, accuracy: 8.5,
   timestamp: '2026-10-25T10:00:00.000Z', latencyMs: 23, downloadMbps: 45.2, uploadMbps: 9.1,
-  jitterMs: 3.4, packetLossPercent: 1, nqs: 82, signalDbm: -96, signalStatus: 'AVAILABLE',
-  metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: true }
+  jitterMs: 3.4, probeFailurePercent: 1, nqs: 82, signalDbm: -96, signalStatus: 'AVAILABLE',
+  metricAvailability: { latency: true, download: true, upload: true, jitter: true, probeFailure: true, signal: true }
 };
 
 function measurement(overrides: Partial<LiveMeasurement> = {}): LiveMeasurement {
@@ -50,7 +50,7 @@ describe('Historical map data', () => {
     const mapped = mapHistoricalRecords({ measurements: [base, { ...base, latitude: 190 }, { ...base, timestamp: 'bad-date' }] });
     assert.equal(mapped.length, 1);
     const unavailable = mapHistoricalRecord({ ...base, latencyMs: null, downloadMbps: null, signalDbm: null,
-      metricAvailability: { latency: false, download: false, upload: true, jitter: false, packetLoss: false, signal: false } });
+      metricAvailability: { latency: false, download: false, upload: true, jitter: false, probeFailure: false, signal: false } });
     assert.ok(unavailable);
     assert.equal(unavailable.latencyMs, 0);
     const html = historicalDetailHtml([unavailable]);
@@ -86,6 +86,23 @@ describe('Historical map data', () => {
     const spec = historicalMarkerSpec([offline], Date.parse('2026-10-26T10:00:00Z'));
     assert.equal(spec.nqs, null);
     assert.equal(spec.color, '#60788C');
+  });
+
+  test('identifies old packetLoss rows as legacy and does not aggregate their NQS as corrected data', () => {
+    const legacy = mapHistoricalRecord({ ...base, packetLossPercent: base.probeFailurePercent,
+      metricAvailability: { latency: true, download: true, upload: true, jitter: true, packetLoss: true, signal: false } });
+    assert.ok(legacy);
+    assert.equal(legacy.measurementMethodVersion, 'legacy-v1');
+    assert.equal(recencyWeightedGroupNqs([legacy]), null);
+    assert.equal(historicalMarkerSpec([legacy]).nqs, null);
+    assert.match(historicalDetailHtml([legacy]), /Legacy measurement method/);
+  });
+
+  test('records with no available score components are explicitly unavailable', () => {
+    const row = mapHistoricalRecord({ ...base, metricAvailability: { latency: false, download: false, upload: false, jitter: false, probeFailure: false, signal: false } });
+    assert.ok(row);
+    assert.equal(row.status, 'UNAVAILABLE');
+    assert.equal(historicalMarkerSpec([row]).nqs, null);
   });
 
   test('history loading, empty, and error states are distinguishable and errors offer retry', () => {

@@ -122,9 +122,9 @@ export const LiveMeasurementCard: React.FC<LiveMeasurementCardProps> = ({
 
             <div style={styles.nqsBigNumberGroup}>
               <span style={{ ...styles.nqsBigNumber, color: nqsColor, textShadow: `0 0 24px ${nqsColor}60` }}>
-                {isOffline ? 'OFFLINE' : nqs ?? '—'}
+                {isOffline ? 'OFFLINE' : status === 'UNAVAILABLE' ? 'N/A' : nqs ?? '—'}
               </span>
-              {!isOffline && <span style={styles.nqsMaxLabel}>/100</span>}
+              {!isOffline && status !== 'UNAVAILABLE' && <span style={styles.nqsMaxLabel}>/100</span>}
             </div>
 
             {/* Prominent Coordinates & Accuracy readout */}
@@ -181,7 +181,7 @@ export const LiveMeasurementCard: React.FC<LiveMeasurementCardProps> = ({
                   <ArrowDownUp size={14} color="#00E676" />
                   <span>HTTP PROBE FAILURE RATE</span>
                 </div>
-                <div style={styles.tileVal}>{currentMeasurement.metricAvailability?.packetLoss === true ? `${currentMeasurement.packetLossPercent} %` : 'N/A'}</div>
+                <div style={styles.tileVal}>{currentMeasurement.metricAvailability?.probeFailure === true ? `${currentMeasurement.probeFailurePercent} %` : 'N/A'}</div>
               </div>
 
               {/* Download Throughput */}
